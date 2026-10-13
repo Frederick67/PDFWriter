@@ -1,0 +1,17 @@
+# dipendenze e build
+node_modules/
+dist/
+release/
+*.log
+
+# file di prova e materiale di terzi (PDF di esempio di Drawboard, screenshot di documenti personali, copie di test)
+samples/
+prova-penna/
+docs/drawboard-ui/
+.tmp/
+public/_test/
+
+# sistema
+Thumbs.db
+.DS_Store
+docs/screenshots/

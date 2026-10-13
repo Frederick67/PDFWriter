@@ -1,0 +1,68 @@
+{
+  "name": "oled-pdf",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview",
+    "start": "npm run build && electron .",
+    "dist": "npm run build && electron-builder --win nsis"
+  },
+  "dependencies": {
+    "@fortawesome/fontawesome-free": "^7.3.1",
+    "pdf-lib": "1.17.1",
+    "pdfjs-dist": "6.4.299"
+  },
+  "devDependencies": {
+    "electron": "^44.7.0",
+    "electron-builder": "^26.15.3",
+    "vite": "8.3.4"
+  },
+  "main": "electron/main.cjs",
+  "description": "Editor PDF a nero OLED, ottimizzato per la batteria, compatibile con le annotazioni di Drawboard PDF",
+  "author": "OLED PDF",
+  "build": {
+    "appId": "app.oledpdf",
+    "productName": "OLED PDF",
+    "copyright": "OLED PDF",
+    "directories": {
+      "buildResources": "build",
+      "output": "release"
+    },
+    "files": [
+      "dist/**",
+      "electron/**",
+      "package.json"
+    ],
+    "win": {
+      "target": [
+        {
+          "target": "nsis",
+          "arch": [
+            "x64"
+          ]
+        }
+      ],
+      "fileAssociations": [
+        {
+          "description": "Documento PDF",
+          "role": "Editor",
+          "ext": "pdf",
+          "name": "Documento PDF"
+        }
+      ],
+      "icon": "build/icon.png"
+    },
+    "nsis": {
+      "createDesktopShortcut": true,
+      "shortcutName": "OLED PDF",
+      "perMachine": false,
+      "allowToChangeInstallationDirectory": true,
+      "oneClick": false,
+      "createStartMenuShortcut": true
+    },
+    "compression": "normal"
+  }
+}
