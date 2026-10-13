@@ -1,5 +1,5 @@
 // Cache-first offline shell. Nessun polling, nessun timer.
-const CACHE = 'oledpdf-v1';
+const CACHE = 'oledpdf-v2';
 
 self.addEventListener('install', (e) => {
   e.waitUntil(caches.open(CACHE).then((c) => c.addAll(['./', 'manifest.webmanifest', 'icon.svg'])));

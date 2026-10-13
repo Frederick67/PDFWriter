@@ -10,99 +10,163 @@
   <link rel="icon" href="icon.svg" type="image/svg+xml">
 </head>
 <body data-tool="view">
+  <a class="skip" href="#pages">Vai al documento</a>
   <header id="top">
-    <i id="logo" class="fa-solid fa-file-pen" aria-hidden="true"></i>
-    <button id="open" class="btn" title="Apri PDF (Ctrl+O)"><i class="fa-regular fa-folder-open"></i> Apri</button>
-    <div id="tabs" role="tablist"></div>
-    <button id="newTab" class="ico" title="Apri un altro PDF in una nuova scheda (Ctrl+T)"><i class="fa-solid fa-plus"></i></button>
+    <div id="brand" aria-hidden="true"><span class="brand-mark"><i data-icon="pen"></i></span></div>
+    <button id="open" class="btn" title="Apri PDF (Ctrl+O)"><i data-icon="open"></i><span class="lbl">Apri</span></button>
+    <div id="tabs" role="tablist" aria-label="Documenti aperti"></div>
+    <button id="newTab" class="ico" title="Apri un altro PDF in una nuova scheda (Ctrl+T)"><i data-icon="plus"></i></button>
     <span class="grow"></span>
-    <nav id="pager" hidden>
-      <button id="prev" class="ico" title="Pagina precedente"><i class="fa-solid fa-chevron-left"></i></button>
-      <span><input id="pageNo" inputmode="numeric" aria-label="Pagina"> / <b id="pageTot">0</b></span>
-      <button id="next" class="ico" title="Pagina successiva"><i class="fa-solid fa-chevron-right"></i></button>
+    <nav id="pager" class="group" hidden aria-label="Pagine">
+      <button id="prev" class="ico" title="Pagina precedente (←)"><i data-icon="prev"></i></button>
+      <label class="pageno"><span class="sr">Pagina</span><input id="pageNo" inputmode="numeric" autocomplete="off"><span class="of">di <b id="pageTot">0</b></span></label>
+      <button id="next" class="ico" title="Pagina successiva (→)"><i data-icon="next"></i></button>
     </nav>
-    <button id="zoomOut" class="ico" title="Riduci"><i class="fa-solid fa-magnifying-glass-minus"></i></button>
-    <span id="zoomPct">100%</span>
-    <button id="zoomIn" class="ico" title="Ingrandisci"><i class="fa-solid fa-magnifying-glass-plus"></i></button>
-    <button id="fit" class="ico" title="Adatta alla larghezza"><i class="fa-solid fa-arrows-left-right"></i></button>
-    <button id="fitPage" class="ico" title="Pagina intera: la pagina entra nello schermo"><i class="fa-solid fa-expand"></i></button>
-    <button id="save" class="btn primary" title="Salva (Ctrl+S)" disabled><i class="fa-regular fa-floppy-disk"></i> Salva</button>
+    <div id="zoombar" class="group" role="group" hidden aria-label="Zoom">
+      <button id="zoomOut" class="ico" title="Riduci (Ctrl+-)"><i data-icon="zoomOut"></i></button>
+      <button id="zoomPct" class="pct" title="Zoom al 100% (Ctrl+0)">100%</button>
+      <button id="zoomIn" class="ico" title="Ingrandisci (Ctrl++)"><i data-icon="zoomIn"></i></button>
+      <span class="vsep" aria-hidden="true"></span>
+      <button id="fit" class="ico" title="Adatta alla larghezza" aria-pressed="false"><i data-icon="fitWidth"></i></button>
+      <button id="fitPage" class="ico" title="Pagina intera: la pagina entra nello schermo" aria-pressed="false"><i data-icon="fitPage"></i></button>
+    </div>
+    <button id="save" class="btn primary" title="Salva (Ctrl+S)" disabled><i data-icon="save"></i><span class="lbl">Salva</span></button>
     <div id="winctl" hidden>
-      <button id="wMin" title="Riduci a icona" aria-label="Riduci a icona"><i class="fa-solid fa-minus"></i></button>
-      <button id="wMax" title="Ingrandisci" aria-label="Ingrandisci"><i class="fa-regular fa-square"></i></button>
-      <button id="wClose" class="close" title="Chiudi" aria-label="Chiudi"><i class="fa-solid fa-xmark"></i></button>
+      <button id="wMin" title="Riduci a icona"><i data-icon="minimize"></i></button>
+      <button id="wMax" title="Ingrandisci"><i data-icon="maximize"></i></button>
+      <button id="wClose" class="close" title="Chiudi"><i data-icon="close"></i></button>
     </div>
   </header>
 
-  <main id="pages"><p id="hint">Apri o trascina qui un PDF.<br>Le annotazioni create con Drawboard PDF restano modificabili.</p></main>
+  <main id="pages" tabindex="-1">
+    <div id="hint">
+      <div class="drop">
+        <div class="drop-ico" aria-hidden="true"><i data-icon="file"></i></div>
+        <h1>Apri un PDF per iniziare</h1>
+        <p>Trascina qui un file oppure sceglilo dal computer.</p>
+        <button id="openBig" class="btn primary lg"><i data-icon="open"></i> Scegli un PDF</button>
+        <div id="resumeSlot"></div>
+        <p class="sub">Le annotazioni create con Drawboard PDF restano modificabili.</p>
+      </div>
+      <ul class="keys" aria-label="Scorciatoie principali">
+        <li><span><kbd>Ctrl</kbd><kbd>O</kbd></span> Apri</li>
+        <li><span><kbd>Ctrl</kbd><kbd>S</kbd></span> Salva</li>
+        <li><span><kbd>Ctrl</kbd><kbd>Z</kbd></span> Annulla</li>
+        <li><span><kbd>Ctrl</kbd><kbd>F</kbd></span> Cerca</li>
+      </ul>
+    </div>
+  </main>
+  <div id="dropzone" aria-hidden="true"><div><i data-icon="upload"></i><b>Rilascia per aprire il PDF</b></div></div>
 
   <nav id="rail" hidden aria-label="Pannelli">
-    <button data-panel="pages" title="Pagine"><i class="fa-regular fa-copy"></i><b id="railCount">0</b></button>
-    <button data-panel="outline" title="Indice"><i class="fa-solid fa-list-ul"></i></button>
-    <button data-panel="search" title="Cerca (Ctrl+F)"><i class="fa-solid fa-magnifying-glass"></i></button>
-    <button data-panel="markups" title="Annotazioni"><i class="fa-regular fa-pen-to-square"></i></button>
+    <button data-panel="pages" title="Pagine" aria-expanded="false"><i data-icon="pages"></i><b id="railCount">0</b></button>
+    <button data-panel="outline" title="Indice" aria-expanded="false"><i data-icon="outline"></i></button>
+    <button data-panel="search" title="Cerca (Ctrl+F)" aria-expanded="false"><i data-icon="search"></i></button>
+    <button data-panel="markups" title="Annotazioni" aria-expanded="false"><i data-icon="markups"></i></button>
     <span class="hsep"></span>
-    <button data-panel="more" title="Impostazioni"><i class="fa-solid fa-ellipsis"></i></button>
+    <button data-panel="more" title="Impostazioni" aria-expanded="false"><i data-icon="settings"></i></button>
   </nav>
 
   <aside id="side" hidden>
-    <section id="p-pages" hidden>
-      <div class="thead"><b>Pagine</b>
-        <button id="addBlank" class="btn" title="Aggiungi una pagina vuota dopo quella corrente"><i class="fa-solid fa-plus"></i> Vuota</button>
-        <button id="addPdf" class="btn" title="Inserisci le pagine di un altro PDF dopo quella corrente"><i class="fa-solid fa-file-import"></i> Da PDF</button>
+    <section id="p-pages" hidden aria-labelledby="h-pages">
+      <div class="thead"><h2 id="h-pages">Pagine</h2>
+        <div class="tools">
+          <button id="addBlank" class="btn soft" title="Aggiungi una pagina vuota dopo quella corrente"><i data-icon="addBlank"></i> Vuota</button>
+          <button id="addPdf" class="btn soft" title="Inserisci le pagine di un altro PDF dopo quella corrente"><i data-icon="addPdf"></i> Da PDF</button>
+        </div>
       </div>
       <div id="thumbList"></div>
       <input id="insFile" type="file" accept="application/pdf,.pdf" hidden>
     </section>
-    <section id="p-outline" hidden>
-      <div class="thead"><b>Indice</b></div>
+    <section id="p-outline" hidden aria-labelledby="h-outline">
+      <div class="thead"><h2 id="h-outline">Indice</h2></div>
       <div id="outlineList" class="plist"></div>
     </section>
-    <section id="p-search" hidden>
-      <div class="thead"><b>Cerca</b><input id="q" type="search" placeholder="Cerca nel documento" autocomplete="off"></div>
-      <div id="searchList" class="plist"></div>
+    <section id="p-search" hidden aria-labelledby="h-search">
+      <div class="thead"><h2 id="h-search">Cerca</h2>
+        <div class="searchbox"><i data-icon="search"></i><input id="q" type="search" placeholder="Cerca nel documento e premi Invio" autocomplete="off" aria-label="Testo da cercare"></div>
+      </div>
+      <div id="searchList" class="plist" aria-live="polite"></div>
     </section>
-    <section id="p-markups" hidden>
-      <div class="thead"><b>Annotazioni</b></div>
+    <section id="p-markups" hidden aria-labelledby="h-markups">
+      <div class="thead"><h2 id="h-markups">Annotazioni</h2></div>
       <div id="markupList" class="plist"></div>
     </section>
-    <section id="p-more" hidden>
-      <div class="thead"><b>Impostazioni</b></div>
+    <section id="p-more" hidden aria-labelledby="h-more">
+      <div class="thead"><h2 id="h-more">Impostazioni</h2></div>
       <div class="plist form">
-        <button id="dark" class="btn on" title="Pagina scura (nero OLED)"><i class="fa-solid fa-moon"></i> Pagina scura</button>
-        <button id="eco" class="btn" title="Risparmio energetico"><i class="fa-solid fa-leaf"></i> Risparmio energetico</button>
-        <label class="field"><span><i class="fa-solid fa-border-all"></i> Griglia sovrapposta</span>
-          <select id="grid" title="Griglia sovrapposta">
+        <h3>Visualizzazione</h3>
+        <button id="dark" class="switch on" role="switch" aria-checked="true">
+          <i data-icon="moon"></i><span><b>Pagina scura</b><small>Inverte la pagina: nero OLED, meno consumo</small></span><span class="knob" aria-hidden="true"></span>
+        </button>
+        <button id="eco" class="switch" role="switch" aria-checked="false">
+          <i data-icon="leaf"></i><span><b>Risparmio energetico</b><small>Rendering a risoluzione ridotta. Si attiva da solo con batteria scarica</small></span><span class="knob" aria-hidden="true"></span>
+        </button>
+        <label class="field"><span><i data-icon="grid"></i> Griglia sovrapposta</span>
+          <select id="grid">
             <option value="">Nessuna</option>
             <option value="lined">Righe</option>
             <option value="grid">Quadretti</option>
             <option value="dots">Punti</option>
           </select>
         </label>
-        <p class="note">Ctrl+O apri · Ctrl+S salva · Ctrl+Z annulla · Ctrl+W chiudi scheda · Ctrl+Tab cambia scheda · Ctrl+F cerca · Ctrl+N nuova finestra · ← → o PagUp/PagGiù cambiano pagina</p>
+        <h3>Accessibilità</h3>
+        <label class="field"><span><i data-icon="textSize"></i> Dimensione dell'interfaccia</span>
+          <select id="uiSize">
+            <option value="s">Compatta</option>
+            <option value="m">Normale</option>
+            <option value="l">Grande</option>
+            <option value="xl">Molto grande</option>
+          </select>
+        </label>
+        <button id="contrast" class="switch" role="switch" aria-checked="false">
+          <i data-icon="contrast"></i><span><b>Contrasto elevato</b><small>Testi più chiari e bordi più marcati</small></span><span class="knob" aria-hidden="true"></span>
+        </button>
+        <h3>Scorciatoie da tastiera</h3>
+        <dl class="kbd-list">
+          <div><dt><kbd>Ctrl</kbd><kbd>O</kbd></dt><dd>Apri</dd></div>
+          <div><dt><kbd>Ctrl</kbd><kbd>S</kbd></dt><dd>Salva</dd></div>
+          <div><dt><kbd>Ctrl</kbd><kbd>Z</kbd></dt><dd>Annulla</dd></div>
+          <div><dt><kbd>Ctrl</kbd><kbd>F</kbd></dt><dd>Cerca</dd></div>
+          <div><dt><kbd>Ctrl</kbd><kbd>W</kbd></dt><dd>Chiudi scheda</dd></div>
+          <div><dt><kbd>Ctrl</kbd><kbd>Tab</kbd></dt><dd>Scheda successiva</dd></div>
+          <div><dt><kbd>Ctrl</kbd><kbd>N</kbd></dt><dd>Nuova finestra</dd></div>
+          <div><dt><kbd>Ctrl</kbd><kbd>+</kbd> <kbd>−</kbd> <kbd>0</kbd></dt><dd>Zoom</dd></div>
+          <div><dt><kbd>←</kbd> <kbd>→</kbd></dt><dd>Cambia pagina</dd></div>
+          <div><dt><kbd>Esc</kbd></dt><dd>Torna a Sfoglia</dd></div>
+        </dl>
       </div>
     </section>
   </aside>
 
   <aside id="fav" hidden aria-label="Strumenti">
-    <button id="view" class="tbtn" title="Sfoglia / seleziona"><i class="fa-solid fa-arrow-pointer"></i></button>
+    <button id="view" class="tbtn" title="Sfoglia e seleziona (Esc)"><i data-icon="pointer"></i></button>
     <span class="hsep"></span>
-    <div id="slots" role="toolbar" aria-orientation="vertical"></div>
-    <button id="addTool" class="tbtn add" title="Crea un nuovo strumento (penna, evidenziatore, gomma...)"><i class="fa-solid fa-plus"></i></button>
+    <div id="slots" role="toolbar" aria-orientation="vertical" aria-label="Strumenti di disegno"></div>
+    <button id="addTool" class="tbtn add" title="Crea un nuovo strumento (penna, evidenziatore, gomma...)"><i data-icon="plus"></i></button>
     <span class="hsep"></span>
-    <button id="lock" class="tbtn" title="Blocco strumento: resta attivo dopo ogni tratto"><i class="fa-solid fa-lock-open"></i></button>
-    <button id="undo" class="tbtn" title="Annulla (Ctrl+Z)" disabled><i class="fa-solid fa-rotate-left"></i></button>
-    <div id="pop" hidden>
-      <label>Nome <input id="popName" type="text" maxlength="28"></label>
-      <label>Tipo <select id="popType"></select></label>
-      <div id="popSw"></div>
-      <label>Colore <input id="popColor" type="color"></label>
-      <label id="popStyleL">Stile <select id="popStyle"></select></label>
-      <label id="popWL">Spessore <input id="popW" type="range" min="0.5" max="20" step="0.5"></label>
-      <label id="popOpL">Opacità <input id="popOp" type="range" min="0.1" max="1" step="0.05"></label>
+    <button id="lock" class="tbtn" title="Blocco strumento: resta attivo dopo ogni tratto"><i data-icon="unlock"></i></button>
+    <button id="undo" class="tbtn" title="Annulla (Ctrl+Z)" disabled><i data-icon="undo"></i></button>
+    <div id="pop" hidden role="dialog" aria-label="Modifica strumento">
+      <div class="pop-head">
+        <span id="popIcon" aria-hidden="true"></span>
+        <input id="popName" type="text" maxlength="28" aria-label="Nome dello strumento">
+      </div>
+      <label class="fld"><span class="fld-h">Tipo</span><select id="popType"></select></label>
+      <div class="fld" role="group" aria-labelledby="popColL">
+        <span class="fld-h" id="popColL">Colore</span>
+        <div class="sw-row"><div id="popSw"></div>
+          <label class="sw custom" title="Colore personalizzato"><input id="popColor" type="color" aria-label="Colore personalizzato"></label>
+        </div>
+      </div>
+      <label id="popStyleL" class="fld"><span class="fld-h">Stile</span><select id="popStyle"></select></label>
+      <label id="popWL" class="fld"><span class="fld-h"><span id="popWT">Spessore</span><output id="popWV"></output></span>
+        <input id="popW" type="range" min="0.5" max="20" step="0.5"></label>
+      <label id="popOpL" class="fld"><span class="fld-h"><span>Opacità</span><output id="popOpV"></output></span>
+        <input id="popOp" type="range" min="0.1" max="1" step="0.05"></label>
       <label id="popSmL" class="chk"><input id="popSm" type="checkbox"> Smussa il tratto</label>
-      <label id="popStL" class="chk"><input id="popSt" type="checkbox"> Raddrizza linee (ink to line)</label>
-      <div class="row"><button id="popDup" class="btn"><i class="fa-regular fa-clone"></i> Duplica</button><button id="popDel" class="btn danger"><i class="fa-regular fa-trash-can"></i> Elimina</button></div>
+      <label id="popStL" class="chk"><input id="popSt" type="checkbox"> Raddrizza le linee</label>
+      <div class="row"><button id="popDup" class="btn soft"><i data-icon="copy"></i> Duplica</button><button id="popDel" class="btn soft danger"><i data-icon="trash"></i> Elimina</button></div>
       <button id="resetTools" class="btn link">Ripristina strumenti predefiniti</button>
     </div>
   </aside>

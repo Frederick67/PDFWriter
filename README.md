@@ -26,6 +26,7 @@ npm run dist       # installer Windows in release/
 Il binario di Electron va scaricato con `node node_modules/electron/install.js` se npm blocca lo script di installazione.
 
 ## Struttura
-- `src/` interfaccia (`main.js`), annotazioni PDF (`annots.js`), operazioni sulle pagine (`pageops.js`), sessione (`session.js`)
+- `src/` interfaccia (`main.js`), annotazioni PDF (`annots.js`), operazioni sulle pagine (`pageops.js`), sessione (`session.js`),
+  icone Lucide (`icons.js`), tooltip/notifiche/dialoghi (`ui.js`)
 - `electron/` processo principale e preload (finestre, file, sessione)
 - `scripts/make-icon.mjs` genera l'icona dell'app

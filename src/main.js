@@ -1,7 +1,7 @@
-import '@fortawesome/fontawesome-free/css/fontawesome.min.css';
-import '@fortawesome/fontawesome-free/css/solid.min.css';
-import '@fortawesome/fontawesome-free/css/regular.min.css';
+import '@fontsource-variable/inter';
 import './style.css';
+import { ic, hydrateIcons } from './icons.js';
+import { initUI, toast, setBusy, confirmDialog } from './ui.js';
 import * as pdfjs from 'pdfjs-dist';
 import workerUrl from 'pdfjs-dist/build/pdf.worker.min.mjs?url';
 import { PDFDocument, ParseSpeeds } from 'pdf-lib';
@@ -10,6 +10,8 @@ import { insertBlank, insertPdf, removePage, rotatePage, duplicatePage, movePage
 import { kvGet, kvSet, kvDel, loadPrefs, savePrefs, serializeDraft, applyDraft } from './session.js';
 
 pdfjs.GlobalWorkerOptions.workerSrc = workerUrl;
+hydrateIcons();
+initUI();
 
 const $ = (id) => document.getElementById(id);
 const hintEl = document.getElementById('hint');
@@ -20,6 +22,7 @@ const els = {
 };
 
 const PALETTE = [[0, 0, 0], [0.9, 0.15, 0.15], [1, 0.55, 0], [1, 0.87, 0.38], [0.1, 0.65, 0.25], [0.15, 0.45, 0.9], [0.55, 0.3, 0.85]];
+const PALETTE_NAMES = ['Nero (bianco sulla pagina scura)', 'Rosso', 'Arancione', 'Giallo', 'Verde', 'Blu', 'Viola'];
 // Tipi di strumento ricavati da Drawboard PDF (PenTool, PenWithPressureTool, CalligraphyInk,
 // HighlightPen, TextHighlight, LaserInkTool, EraserTool) con le sue opzioni (spessore, opacità, smussatura, ink-to-line).
 const DEFAULT_SLOTS = [
@@ -44,21 +47,35 @@ const INK_TOOLS = new Set(['pen', 'marker']);
 const state = {
   lib: null, doc: null, pages: [], scale: 1, tool: 'view', slot: -1, slots: loadSlots(), lock: true,
   dark: true, eco: false, userEco: false, finger: false, grid: '', dirty: false, name: 'documento.pdf', handle: null, path: null, fitMode: null,
-  undo: [], encrypted: false,
+  undo: [], encrypted: false, ui: 'm', contrast: false,
 };
 
-// Impostazioni salvate (tema, eco, griglia, blocco strumento)
+// Interruttore accessibile (role="switch"): stato visivo e aria-checked insieme.
+const setSwitch = (el, on) => { el.classList.toggle('on', on); el.setAttribute('aria-checked', String(on)); };
+const applyUi = () => {
+  document.documentElement.dataset.ui = state.ui;
+  document.documentElement.dataset.contrast = state.contrast ? '1' : '0';
+};
+
+// Impostazioni salvate (tema, eco, griglia, blocco strumento, dimensione e contrasto dell'interfaccia)
 {
   const pr = loadPrefs();
   if (typeof pr.dark === 'boolean') state.dark = pr.dark;
   if (typeof pr.eco === 'boolean') { state.eco = pr.eco; state.userEco = true; }
   if (typeof pr.lock2 === 'boolean') state.lock = pr.lock2;
   if (typeof pr.grid === 'string') state.grid = pr.grid;
-  $('dark').classList.toggle('on', state.dark);
-  $('eco').classList.toggle('on', state.eco);
+  if (['s', 'm', 'l', 'xl'].includes(pr.ui)) state.ui = pr.ui;
+  if (typeof pr.contrast === 'boolean') state.contrast = pr.contrast;
+  setSwitch($('dark'), state.dark);
+  setSwitch($('eco'), state.eco);
+  setSwitch($('contrast'), state.contrast);
   $('grid').value = state.grid;
+  $('uiSize').value = state.ui;
+  applyUi();
 }
-const persistPrefs = () => savePrefs({ dark: state.dark, eco: state.userEco ? state.eco : undefined, lock2: state.lock, grid: state.grid });
+const persistPrefs = () => savePrefs({
+  dark: state.dark, eco: state.userEco ? state.eco : undefined, lock2: state.lock, grid: state.grid, ui: state.ui, contrast: state.contrast,
+});
 
 function loadSlots() {
   try {
@@ -72,7 +89,13 @@ const saveSlots = () => { try { localStorage.setItem('oledpdf.slots2', JSON.stri
 const dpr = () => Math.min(window.devicePixelRatio || 1, state.eco ? 1 : 2);
 const perf = (() => { let t0 = performance.now(); return (label) => { if (window.__perf) { const t = performance.now(); console.log('PERF', label, Math.round(t - t0), 'ms'); t0 = t; } }; })();
 const docTitle = () => (active ? `${state.name}${state.dirty ? ' •' : ''} · OLED PDF` : 'OLED PDF');
-const setStatus = (t) => { document.title = t ? `${t} · OLED PDF` : docTitle(); };
+// Stato in corso: titolo della finestra + pillola visibile ("Apertura…"); i messaggi informativi diventano notifiche.
+const setStatus = (t) => {
+  document.title = t ? `${t} · OLED PDF` : docTitle();
+  const working = !!t && t.endsWith('…');
+  setBusy(working ? t : '');
+  if (t && !working) toast(t, { type: 'warn', ms: 4500 });
+};
 
 /* ---------- colori (adattati al nero OLED solo in visualizzazione) ---------- */
 function disp(c) {
@@ -147,13 +170,26 @@ function renderTabs() {
     const t = document.createElement('div');
     t.className = `tab${rec === active ? ' on' : ''}`;
     t.title = rec.path || rec.name;
+    t.setAttribute('role', 'tab');
+    t.setAttribute('aria-selected', String(rec === active));
+    t.tabIndex = rec === active ? 0 : -1;
     const dirty = rec === active ? state.dirty : rec.dirty;
     const n = document.createElement('span'); n.className = 'tn'; n.textContent = rec.name;
-    const d = document.createElement('i'); d.className = 'tdot'; d.hidden = !dirty; d.title = 'Modifiche non salvate';
-    const x = document.createElement('button'); x.className = 'tx'; x.innerHTML = '<i class="fa-solid fa-xmark"></i>'; x.title = 'Chiudi scheda (Ctrl+W)';
+    const d = document.createElement('i'); d.className = 'tdot'; d.hidden = !dirty; d.title = 'Modifiche non salvate'; d.setAttribute('role', 'img');
+    const x = document.createElement('button'); x.className = 'tx'; x.innerHTML = ic('close'); x.title = `Chiudi ${rec.name} (Ctrl+W)`; x.tabIndex = -1;
     x.addEventListener('click', (e) => { e.stopPropagation(); closeDoc(rec); });
+    t.insertAdjacentHTML('beforeend', ic('file'));
     t.append(n, d, x);
     t.addEventListener('click', () => { if (rec !== active) activate(rec); });
+    t.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); if (rec !== active) activate(rec); }
+      else if (e.key === 'Delete') closeDoc(rec);
+      else if (e.key === 'ArrowRight' || e.key === 'ArrowLeft') {
+        e.preventDefault(); e.stopPropagation();
+        switchTab(e.key === 'ArrowRight' ? 1 : -1);
+        els.tabs.querySelector('.tab.on')?.focus();
+      }
+    });
     t.addEventListener('auxclick', (e) => { if (e.button === 1) closeDoc(rec); });
     // riordino per trascinamento
     t.draggable = true;
@@ -173,10 +209,14 @@ function renderTabs() {
   scheduleSession();
 }
 
-function closeDoc(rec) {
+async function closeDoc(rec) {
   const dirty = rec === active ? state.dirty : rec.dirty;
-  if (dirty && !confirm(`"${rec.name}" ha modifiche non salvate. Chiuderlo comunque?`)) return;
+  if (dirty && !(await confirmDialog({
+    title: 'Chiudere senza salvare?', message: `"${rec.name}" ha modifiche non salvate che andranno perse.`,
+    ok: 'Chiudi senza salvare', cancel: 'Annulla', danger: true,
+  }))) return;
   const i = docs.indexOf(rec);
+  if (i < 0) return;
   if (rec === active) active = null; // evita di risalvare lo stato in un documento rimosso
   docs.splice(i, 1);
   kvDel(draftKey(rec.name, rec.size));
@@ -216,7 +256,7 @@ async function loadBytes(bytes, opts = {}) {
     lib = await PDFDocument.load(bytes, { ignoreEncryption: true, updateMetadata: false, parseSpeed: ParseSpeeds.Fastest });
   } catch (e) {
     setStatus('');
-    alert(`PDF non leggibile: ${e.message}`);
+    toast(`PDF non leggibile: ${e.message}`, { type: 'error', ms: 8000 });
     return;
   }
   perf('load: pdf-lib');
@@ -782,18 +822,23 @@ const fromHex = (h) => [1, 3, 5].map((i) => parseInt(h.slice(i, i + 2), 16) / 25
 
 // Icone degli strumenti: Font Awesome (penna, pennino della stilografica, pennarello, evidenziatore, gomma...).
 // Il colore dello strumento colora l'icona.
-const TOOL_ICON = { marker: 'fa-marker', highlighter: 'fa-highlighter', eraser: 'fa-eraser', laser: 'fa-bullseye', text: 'fa-font', rect: 'fa-square' };
+const toolIcon = (s) => (s.type === 'pen' ? (s.style === 'calligraphy' ? 'nib' : s.style === 'fixed' ? 'pencil' : 'pen') : s.type);
+const toolColor = (s) => (s.type === 'eraser' ? '#e7b3b3' : rgba(s.color, 1));
+// Icona colorata + pallino che mostra lo spessore: si distinguono a colpo d'occhio due penne dello stesso colore.
 function glyph(s) {
-  const icon = s.type === 'pen' ? (s.style === 'calligraphy' ? 'fa-pen-nib' : s.style === 'fixed' ? 'fa-pencil' : 'fa-pen') : TOOL_ICON[s.type] || 'fa-pen';
-  const col = s.type === 'eraser' ? '#d9a5a5' : rgba(s.color, 1);
-  return `<i class="${s.type === 'rect' ? 'fa-regular' : 'fa-solid'} ${icon}" style="color:${col}"></i>`;
+  const col = toolColor(s);
+  const showW = INK_TOOLS.has(s.type) || s.type === 'highlighter' || s.type === 'rect';
+  const w = Math.max(3, Math.min(14, Math.round(2 + Math.sqrt(s.width) * 2.2)));
+  return ic(toolIcon(s), { color: col }) + (showW ? `<span class="wdot" style="width:${w}px;height:3px;color:${col}"></span>` : '');
 }
 function renderFav() {
   els.slots.replaceChildren();
   state.slots.forEach((s, i) => {
     const b = document.createElement('button');
-    b.className = `slot${i === state.slot && state.tool !== 'view' ? ' on' : ''}`;
-    b.title = `${toolName(s)} — clic di nuovo per modificare, trascina per riordinare`;
+    const on = i === state.slot && state.tool !== 'view';
+    b.className = `slot${on ? ' on' : ''}`;
+    b.title = on ? `${toolName(s)} — clic per modificare` : toolName(s);
+    b.setAttribute('aria-pressed', String(on));
     b.innerHTML = glyph(s);
     b.draggable = true;
     b.addEventListener('click', () => {
@@ -814,8 +859,10 @@ function renderFav() {
     els.slots.append(b);
   });
   $('view').classList.toggle('on', state.tool === 'view');
+  $('view').setAttribute('aria-pressed', String(state.tool === 'view'));
   $('lock').classList.toggle('on', state.lock);
-  $('lock').innerHTML = state.lock ? '<i class="fa-solid fa-lock"></i>' : '<i class="fa-solid fa-lock-open"></i>';
+  $('lock').setAttribute('aria-pressed', String(state.lock));
+  $('lock').innerHTML = ic(state.lock ? 'lock' : 'unlock');
 }
 
 function selectTool(t) {
@@ -842,21 +889,26 @@ function fillPop() {
   const s = slotCur();
   if (!s) return;
   els.popSw.replaceChildren();
-  for (const c of PALETTE) {
+  PALETTE.forEach((c, i) => {
     const b = document.createElement('button');
-    b.className = `sw${c.join() === s.color.join() ? ' on' : ''}`;
+    const on = c.join() === s.color.join();
+    b.className = `sw${on ? ' on' : ''}`;
     b.style.background = rgba(c, 1);
-    b.addEventListener('click', () => { s.color = c; saveSlots(); renderFav(); fillPop(); });
+    b.title = PALETTE_NAMES[i];
+    b.setAttribute('aria-pressed', String(on));
+    b.addEventListener('click', () => { s.color = c; saveSlots(); renderFav(); fillPop(); els.popSw.children[i]?.focus(); });
     els.popSw.append(b);
-  }
+  });
   const ink = INK_TOOLS.has(s.type);
+  $('popIcon').innerHTML = ic(toolIcon(s), { color: toolColor(s) });
   $('popName').value = s.name || '';
   $('popName').placeholder = toolName({ ...s, name: '' });
   $('popType').replaceChildren(...Object.entries(TYPES).map(([k, v]) => new Option(v, k, false, k === s.type)));
   $('popColor').value = toHex(s.color);
   els.popW.value = s.width;
   els.popW.max = s.type === 'text' ? 48 : s.type === 'marker' || s.type === 'highlighter' ? 40 : 20;
-  $('popWL').firstChild.textContent = s.type === 'text' ? 'Corpo ' : s.type === 'eraser' ? 'Raggio ' : 'Spessore ';
+  $('popWT').textContent = s.type === 'text' ? 'Corpo' : s.type === 'eraser' ? 'Raggio' : 'Spessore';
+  showPopValues();
   $('popStyleL').hidden = s.type !== 'pen';
   $('popOpL').hidden = !ink;
   $('popSmL').hidden = !ink;
@@ -868,7 +920,14 @@ function fillPop() {
   $('popSm').checked = s.smooth !== false;
   $('popSt').checked = !!s.straighten;
 }
-const editSlot = (fn) => { const s = slotCur(); if (!s) return; fn(s); saveSlots(); renderFav(); };
+function showPopValues() {
+  const s = slotCur();
+  if (!s) return;
+  $('popWV').textContent = s.type === 'text' ? `${s.width} pt` : `${(+s.width).toFixed(1).replace(/\.0$/, '')}`;
+  $('popOpV').textContent = `${Math.round((s.opacity ?? 1) * 100)}%`;
+  $('popIcon').innerHTML = ic(toolIcon(s), { color: toolColor(s) });
+}
+const editSlot = (fn) => { const s = slotCur(); if (!s) return; fn(s); saveSlots(); renderFav(); showPopValues(); };
 els.popW.addEventListener('input', () => editSlot((s) => { s.width = +els.popW.value; }));
 $('popName').addEventListener('input', (e) => editSlot((s) => { s.name = e.target.value.trim(); }));
 $('popColor').addEventListener('input', (e) => { editSlot((s) => { s.color = fromHex(e.target.value); }); });
@@ -896,8 +955,11 @@ $('popDel').addEventListener('click', () => {
   if (state.slot < 0) selectTool('view'); else selectTool(state.slots[state.slot].type);
 });
 $('addTool').addEventListener('click', () => addTool('pen'));
-$('resetTools').addEventListener('click', () => {
-  if (!confirm('Ripristinare gli strumenti predefiniti? Gli strumenti creati andranno persi.')) return;
+$('resetTools').addEventListener('click', async () => {
+  if (!(await confirmDialog({
+    title: 'Ripristinare gli strumenti?', message: 'Gli strumenti creati o modificati verranno sostituiti da quelli predefiniti.',
+    ok: 'Ripristina', danger: true,
+  }))) return;
   state.slots = structuredClone(DEFAULT_SLOTS); state.slot = -1; saveSlots(); els.pop.hidden = true; selectTool('view');
 });
 
@@ -946,6 +1008,8 @@ function zoom(f) {
 }
 $('zoomIn').addEventListener('click', () => zoom(1.2));
 $('zoomOut').addEventListener('click', () => zoom(1 / 1.2));
+const zoomReset = () => { if (state.pages.length) zoom(1 / state.scale); };
+els.zoomPct.addEventListener('click', zoomReset);
 // Adatta alla larghezza / pagina intera: sono modalità che restano attive e si riapplicano da sole
 // quando cambiano finestra, pannelli laterali, scheda o pagina.
 function applyFit(mode) {
@@ -961,8 +1025,10 @@ function applyFit(mode) {
   markFit();
 }
 function markFit() {
-  $('fit').classList.toggle('on', state.fitMode === 'width');
-  $('fitPage').classList.toggle('on', state.fitMode === 'page');
+  for (const [id, m] of [['fit', 'width'], ['fitPage', 'page']]) {
+    $(id).classList.toggle('on', state.fitMode === m);
+    $(id).setAttribute('aria-pressed', String(state.fitMode === m));
+  }
 }
 $('fit').addEventListener('click', () => { state.fitMode = state.fitMode === 'width' ? null : 'width'; if (state.fitMode) applyFit('width'); else markFit(); });
 $('fitPage').addEventListener('click', () => { state.fitMode = state.fitMode === 'page' ? null : 'page'; if (state.fitMode) applyFit('page'); else markFit(); });
@@ -971,10 +1037,13 @@ const refit = () => { if (!state.fitMode || fitRaf) return; fitRaf = requestAnim
 window.addEventListener('resize', refit);els.pages.addEventListener('wheel', (e) => { if (e.ctrlKey) { e.preventDefault(); zoom(e.deltaY < 0 ? 1.1 : 1 / 1.1); } }, { passive: false });
 
 function invalidateAll() { layout(); }
-$('dark').addEventListener('click', (e) => { state.dark = !state.dark; e.currentTarget.classList.toggle('on', state.dark); persistPrefs(); invalidateAll(); renderFav(); });
-function setEco(on) { state.eco = on; $('eco').classList.toggle('on', on); invalidateAll(); }
+$('dark').addEventListener('click', (e) => { state.dark = !state.dark; setSwitch(e.currentTarget, state.dark); persistPrefs(); invalidateAll(); renderFav(); });
+function setEco(on) { state.eco = on; setSwitch($('eco'), on); invalidateAll(); }
 $('eco').addEventListener('click', () => { state.userEco = true; setEco(!state.eco); persistPrefs(); });
 $('grid').addEventListener('change', (e) => { state.grid = e.target.value; persistPrefs(); state.pages.forEach(drawGrid); });
+// La dimensione dell'interfaccia cambia i margini dell'area pagine: le modalità "adatta" si ricalcolano.
+$('uiSize').addEventListener('change', (e) => { state.ui = e.target.value; applyUi(); persistPrefs(); refit(); });
+$('contrast').addEventListener('click', (e) => { state.contrast = !state.contrast; setSwitch(e.currentTarget, state.contrast); applyUi(); persistPrefs(); });
 
 // Risparmio automatico quando la batteria è scarica e non in carica (se il browser espone l'API)
 navigator.getBattery?.().then((b) => {
@@ -1001,16 +1070,25 @@ async function openDialog() {
   } else els.file.click();
 }
 $('open').addEventListener('click', openDialog);
+$('openBig').addEventListener('click', openDialog);
 els.file.addEventListener('change', async () => {
   const f = els.file.files[0]; if (!f) return;
   await loadBytes(new Uint8Array(await f.arrayBuffer()), { name: f.name, handle: null });
   els.file.value = '';
 });
-els.pages.addEventListener('dragover', (e) => e.preventDefault());
-els.pages.addEventListener('drop', async (e) => {
+// Trascinamento di un file: tutta la finestra diventa la zona di rilascio, con un riquadro ben visibile.
+const hasFiles = (e) => e.dataTransfer?.types.includes('Files');
+let dragDepth = 0;
+window.addEventListener('dragenter', (e) => { if (hasFiles(e)) { dragDepth++; document.body.classList.add('dragging'); } });
+window.addEventListener('dragleave', (e) => { if (hasFiles(e) && --dragDepth <= 0) { dragDepth = 0; document.body.classList.remove('dragging'); } });
+window.addEventListener('dragover', (e) => { if (hasFiles(e)) e.preventDefault(); });
+window.addEventListener('drop', async (e) => {
+  if (!hasFiles(e)) return;
   e.preventDefault();
+  dragDepth = 0; document.body.classList.remove('dragging');
   const f = e.dataTransfer.files[0];
   if (f && /pdf$/i.test(f.type || f.name)) await loadBytes(new Uint8Array(await f.arrayBuffer()), { name: f.name, handle: null });
+  else if (f) toast('Si possono aprire solo file PDF.', { type: 'warn' });
 });
 window.launchQueue?.setConsumer(async (lp) => { if (lp.files?.[0]) await openFromHandle(lp.files[0]); });
 
@@ -1039,17 +1117,21 @@ async function save() {
     clearTimeout(draftTimer);
     await kvDel(draftKey(state.name, active.origSize));
     await loadBytes(bytes, { replace: true, noDraft: true, name: state.name, path: state.path, handle: state.handle }); // ricarica: verifica anche che il file prodotto sia leggibile
+    toast(`Salvato: ${state.name}`, { type: 'ok', ms: 2200 });
   } catch (e) {
     console.error(e); setStatus('');
-    alert(`Salvataggio non riuscito: ${e.message}`);
+    toast(`Salvataggio non riuscito: ${e.message}`, { type: 'error', ms: 9000 });
   }
 }
 els.save.addEventListener('click', save);
 
 window.addEventListener('keydown', (e) => {
-  if (e.target.closest?.('textarea,input')) return;
+  if (e.target.closest?.('textarea,input,select,dialog')) return;
   const k = e.key.toLowerCase();
   if ((e.ctrlKey || e.metaKey) && k === 's') { e.preventDefault(); save(); }
+  else if ((e.ctrlKey || e.metaKey) && (k === '+' || k === '=')) { e.preventDefault(); if (state.pages.length) zoom(1.2); }
+  else if ((e.ctrlKey || e.metaKey) && k === '-') { e.preventDefault(); if (state.pages.length) zoom(1 / 1.2); }
+  else if ((e.ctrlKey || e.metaKey) && k === '0') { e.preventDefault(); zoomReset(); }
   else if ((e.ctrlKey || e.metaKey) && k === 'o') { e.preventDefault(); openDialog(); }
   else if ((e.ctrlKey || e.metaKey) && k === 'z') { e.preventDefault(); undo(); }
   else if ((e.ctrlKey || e.metaKey) && k === 'w') { e.preventDefault(); if (active) closeDoc(active); }
@@ -1078,7 +1160,10 @@ function openPanel(name) {
   side.hidden = !sidePanel;
   document.body.classList.toggle('side', !!sidePanel);
   for (const n of PANELS) $(`p-${n}`).hidden = n !== sidePanel;
-  for (const b of rail.querySelectorAll('button')) b.classList.toggle('on', b.dataset.panel === sidePanel);
+  for (const b of rail.querySelectorAll('button')) {
+    b.classList.toggle('on', b.dataset.panel === sidePanel);
+    b.setAttribute('aria-expanded', String(b.dataset.panel === sidePanel));
+  }
   if (sidePanel === 'pages') buildThumbs();
   else thumbIO?.disconnect();
   if (sidePanel === 'outline') buildOutline();
@@ -1098,7 +1183,7 @@ async function buildOutline() {
     for (const it of items) {
       const b = document.createElement('button');
       b.className = 'item'; b.style.paddingLeft = `${9 + depth * 14}px`;
-      b.innerHTML = `<i class="fa-regular fa-bookmark"></i><span>${esc(it.title || '(senza titolo)')}</span>`;
+      b.innerHTML = `${ic('bookmark')}<span>${esc(it.title || '(senza titolo)')}</span>`;
       b.addEventListener('click', async () => {
         try {
           let dest = it.dest;
@@ -1138,12 +1223,19 @@ async function runSearch(q) {
       list.append(item);
     }
   }
-  if (run === searchRun && !found) list.innerHTML = '<div class="empty">Nessun risultato.</div>';
+  if (run !== searchRun) return;
+  if (!found) list.innerHTML = '<div class="empty">Nessun risultato.</div>';
+  else {
+    const head = document.createElement('div');
+    head.className = 'summary';
+    head.textContent = found >= 300 ? 'Oltre 300 risultati (mostrati i primi 300)' : `${found} ${found === 1 ? 'risultato' : 'risultati'}`;
+    list.prepend(head);
+  }
 }
 $('q').addEventListener('keydown', (e) => { if (e.key === 'Enter') runSearch(e.target.value); });
 
 // Elenco delle annotazioni (anche quelle create con Drawboard)
-const MARKUP_LABEL = { Ink: ['fa-pen', 'Penna'], Highlight: ['fa-highlighter', 'Evidenziatore'], Underline: ['fa-underline', 'Sottolineatura'], StrikeOut: ['fa-strikethrough', 'Barrato'], Squiggly: ['fa-underline', 'Ondulato'], Square: ['fa-square', 'Rettangolo'], Circle: ['fa-circle', 'Ellisse'], Line: ['fa-slash', 'Linea'], FreeText: ['fa-font', 'Testo'] };
+const MARKUP_LABEL = { Ink: ['pen', 'Penna'], Highlight: ['highlighter', 'Evidenziatore'], Underline: ['underline', 'Sottolineatura'], StrikeOut: ['strike', 'Barrato'], Squiggly: ['underline', 'Ondulato'], Square: ['rect', 'Rettangolo'], Circle: ['circle', 'Ellisse'], Line: ['line', 'Linea'], FreeText: ['text', 'Testo'] };
 function buildMarkups() {
   const list = $('markupList');
   list.replaceChildren();
@@ -1162,24 +1254,24 @@ function buildMarkups() {
     inks.forEach((a, i) => { const r = root(i); (groups.get(r) || groups.set(r, []).get(r)).push(a); });
     for (const g of groups.values()) {
       const rect = [Math.min(...g.map((a) => a.rect[0])), Math.min(...g.map((a) => a.rect[1])), Math.max(...g.map((a) => a.rect[2])), Math.max(...g.map((a) => a.rect[3]))];
-      items.push({ p, rect, y: rect[3], icon: 'fa-pen', label: g.length > 1 ? `Scrittura a mano · ${g.length} tratti` : 'Tratto a mano', color: g[0].color });
+      items.push({ p, rect, y: rect[3], icon: 'pen', label: g.length > 1 ? `Scrittura a mano · ${g.length} tratti` : 'Tratto a mano', color: g[0].color });
     }
     for (const a of live) {
       if (a.subtype === 'Ink') continue;
-      const [icon, label] = MARKUP_LABEL[a.subtype] || ['fa-pen', a.subtype];
+      const [icon, label] = MARKUP_LABEL[a.subtype] || ['pen', a.subtype];
       items.push({ p, rect: a.rect, y: a.rect[3], icon, label: a.text ? a.text.slice(0, 60) : label, color: a.color });
     }
   }
   if (!items.length) { list.innerHTML = '<div class="empty">Nessuna annotazione.</div>'; return; }
   const head = document.createElement('div');
-  head.className = 'empty';
+  head.className = 'summary';
   head.textContent = Object.entries(counts).map(([k, n]) => `${n} ${(MARKUP_LABEL[k] || [, k])[1].toLowerCase()}`).join(' · ');
   list.append(head);
   items.sort((x, y) => x.p.index - y.p.index || y.y - x.y); // per pagina, dall'alto in basso
   for (const it of items.slice(0, 500)) {
     const b = document.createElement('button');
     b.className = 'item';
-    b.innerHTML = `<i class="fa-solid ${it.icon}" style="color:${rgba(it.color, 1)}"></i><span>${esc(it.label)}</span><small>p. ${it.p.index + 1}</small>`;
+    b.innerHTML = `${ic(it.icon, { color: rgba(it.color, 1) })}<span>${esc(it.label)}</span><small>p. ${it.p.index + 1}</small>`;
     b.addEventListener('click', () => flashAnnot(it.p, { rect: it.rect }));
     list.append(b);
   }
@@ -1193,14 +1285,14 @@ function buildMarkups() {
     if (!p.ov.width) return;
     const [x0, y0, x1, y1] = rectBox(p.vp, a.rect);
     ctx.save(); ctx.setTransform(p.d, 0, 0, p.d, 0, 0);
-    ctx.strokeStyle = '#38d39f'; ctx.lineWidth = 2; ctx.setLineDash([6, 4]);
+    ctx.strokeStyle = '#3ddc9f'; ctx.lineWidth = 2; ctx.setLineDash([6, 4]);
     ctx.strokeRect(x0 - 4, y0 - 4, x1 - x0 + 8, y1 - y0 + 8);
     ctx.restore();
     setTimeout(() => draw(p), 1100);
   }, 250);
 }
 
-const setChrome = (on) => { rail.hidden = !on; els.fav.hidden = !on; if (!on && sidePanel) openPanel(sidePanel); };
+const setChrome = (on) => { rail.hidden = !on; els.fav.hidden = !on; $('zoombar').hidden = !on; if (!on && sidePanel) openPanel(sidePanel); };
 const refreshPanels = () => {
   $('railCount').textContent = String(state.doc?.numPages ?? 0);
   if (sidePanel === 'outline') buildOutline();
@@ -1224,22 +1316,32 @@ function buildThumbs() {
   state.pages.forEach((p, i) => {
     const vp = p.proxy.getViewport({ scale: 1 }), h = Math.round((vp.height * THUMB_W) / vp.width);
     const it = document.createElement('div');
-    it.className = 'th'; it.dataset.i = i; it.draggable = true;
+    it.className = 'th'; it.dataset.i = i; it.draggable = true; it.tabIndex = 0;
+    it.setAttribute('role', 'button'); it.setAttribute('aria-label', `Vai alla pagina ${i + 1}`);
     const c = document.createElement('canvas');
     c.style.width = `${THUMB_W}px`; c.style.height = `${h}px`;
     const n = document.createElement('span'); n.className = 'tnum'; n.textContent = String(i + 1);
     const bar = document.createElement('div'); bar.className = 'tact';
-    const mk = (label, title, fn) => {
-      const b = document.createElement('button'); b.innerHTML = label; b.title = title;
+    const mk = (icon, title, fn, cls = '') => {
+      const b = document.createElement('button'); b.innerHTML = ic(icon); b.title = title; b.className = cls;
       b.addEventListener('click', (e) => { e.stopPropagation(); fn(); });
+      b.addEventListener('keydown', (e) => e.stopPropagation());
       bar.append(b);
     };
-    mk('<i class="fa-solid fa-rotate-right"></i>', 'Ruota di 90°', () => pageOp((l) => rotatePage(l, i), i));
-    mk('<i class="fa-regular fa-clone"></i>', 'Duplica la pagina', () => pageOp((l) => duplicatePage(l, i), i + 1));
-    mk('<i class="fa-solid fa-plus"></i>', 'Inserisci una pagina vuota dopo', () => pageOp((l) => insertBlank(l, i + 1), i + 1));
-    mk('<i class="fa-regular fa-trash-can"></i>', 'Elimina la pagina', () => { if (confirm(`Eliminare la pagina ${i + 1}?`)) pageOp((l) => removePage(l, i), Math.max(0, i - 1)); });
+    mk('rotate', 'Ruota di 90°', () => pageOp((l) => rotatePage(l, i), i));
+    mk('copy', 'Duplica la pagina', () => pageOp((l) => duplicatePage(l, i), i + 1));
+    mk('plus', 'Inserisci una pagina vuota dopo', () => pageOp((l) => insertBlank(l, i + 1), i + 1));
+    mk('trash', 'Elimina la pagina', async () => {
+      if (await confirmDialog({ title: `Eliminare la pagina ${i + 1}?`, message: 'La pagina e le sue annotazioni verranno rimosse. Puoi ancora chiudere senza salvare per annullare.', ok: 'Elimina', danger: true })) {
+        pageOp((l) => removePage(l, i), Math.max(0, i - 1));
+      }
+    }, 'del');
     it.append(c, n, bar);
     it.addEventListener('click', () => goPage(i + 1));
+    it.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); goPage(i + 1); }
+      else if (e.key === 'ArrowDown' || e.key === 'ArrowUp') { e.preventDefault(); e.stopPropagation(); thumbList.children[i + (e.key === 'ArrowDown' ? 1 : -1)]?.focus(); }
+    });
     it.addEventListener('dragstart', (e) => e.dataTransfer.setData('application/x-oledpdf-page', String(i)));
     it.addEventListener('dragover', (e) => { if (e.dataTransfer.types.includes('application/x-oledpdf-page')) e.preventDefault(); });
     it.addEventListener('drop', (e) => {
@@ -1303,7 +1405,7 @@ async function pageOp(fn, goto) {
     if (goto != null) goPage(goto + 1);
   } catch (e) {
     console.error(e);
-    alert(`Operazione non riuscita: ${e.message}`);
+    toast(`Operazione non riuscita: ${e.message}`, { type: 'error', ms: 8000 });
   } finally {
     busyOp = false;
     setStatus('');
@@ -1348,7 +1450,7 @@ window.addEventListener('pagehide', persistAll);
 // Electron: prima di chiudere la finestra salva tutto, poi conferma. La finestra si chiude sempre, anche con modifiche non salvate.
 window.native?.onBeforeClose(async () => { try { await persistAll(); } finally { window.native.closeReady(); } });
 
-window.native?.onOpen(async (p) => { try { await openNative(await window.native.read(p)); } catch (e) { alert(`Impossibile aprire il file: ${e.message}`); } });
+window.native?.onOpen(async (p) => { try { await openNative(await window.native.read(p)); } catch (e) { toast(`Impossibile aprire il file: ${e.message}`, { type: 'error', ms: 8000 }); } });
 
 async function resume() {
   if (new URLSearchParams(location.search).has('blank') || userOpened || docs.length) return; // nuova finestra o PDF già aperto: parte vuota
@@ -1384,7 +1486,8 @@ async function resume() {
   }
   if (needPermission.length && !loaded.length) {
     const b = document.createElement('button');
-    b.className = 'btn primary'; b.textContent = `Riprendi sessione (${needPermission.length} file)`;
+    b.className = 'btn soft'; b.innerHTML = `${ic('undo')}<span></span>`;
+    b.lastChild.textContent = `Riprendi la sessione precedente (${needPermission.length} file)`;
     b.addEventListener('click', async () => {
       b.remove();
       for (const t of needPermission) {
@@ -1394,7 +1497,7 @@ async function resume() {
         } catch { /* ignora */ }
       }
     });
-    hintEl.append(document.createElement('br'), b);
+    $('resumeSlot').append(b);
   }
 }
 if (!window.launchQueue && !window.native) resume();
@@ -1411,7 +1514,7 @@ if (window.native) {
   $('wMax').addEventListener('click', () => window.native.winToggleMax());
   $('wClose').addEventListener('click', () => window.native.winClose());
   window.native.onMaxState((max) => {
-    $('wMax').innerHTML = max ? '<i class="fa-regular fa-window-restore"></i>' : '<i class="fa-regular fa-square"></i>';
+    $('wMax').innerHTML = ic(max ? 'restore' : 'maximize');
     $('wMax').title = max ? 'Ripristina' : 'Ingrandisci';
   });
 }
