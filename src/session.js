@@ -33,6 +33,16 @@ export function savePrefs(p) {
   try { localStorage.setItem('oledpdf.prefs', JSON.stringify(p)); } catch { /* ignore */ }
 }
 
+// Impronta veloce del file (FNV-1a su inizio e fine): distingue file con stesso nome e stessa dimensione.
+export function fingerprint(bytes) {
+  let h = 0x811c9dc5;
+  const n = bytes.length, part = Math.min(n, 65536);
+  const mix = (i) => { h ^= bytes[i]; h = Math.imul(h, 0x01000193); };
+  for (let i = 0; i < part; i++) mix(i);
+  for (let i = Math.max(part, n - part); i < n; i++) mix(i);
+  return (h >>> 0).toString(36);
+}
+
 // Bozza = modifiche non ancora salvate: annotazioni nuove + indici delle esistenti eliminate.
 export function serializeDraft(pages) {
   const out = {};

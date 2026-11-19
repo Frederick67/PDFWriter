@@ -4,7 +4,8 @@ import {
   Files, ListTree, Search, MessageSquareText, Settings2, FilePlus, FileInput, Moon, Leaf, Grid3x3, MousePointer2, Lock,
   LockOpen, Undo2, Trash, Pen, PenTool, Pencil, Highlighter, Eraser, Crosshair, Type, Bookmark, Underline, Strikethrough,
   Circle, Slash, RotateCw, FileText, Upload, Keyboard, Brush, ALargeSmall, Info, CircleAlert, CircleCheck, TriangleAlert,
-  RectangleHorizontal, Contrast,
+  RectangleHorizontal, Contrast, Redo2, Lasso, Ruler, BookOpen, EllipsisVertical, Printer, Image, FileOutput, Layers,
+  ArrowUpRight, BookmarkPlus, PencilLine, Clock, Eye,
 } from 'lucide';
 
 const ICONS = {
@@ -15,7 +16,9 @@ const ICONS = {
   nib: PenTool, pencil: Pencil, highlighter: Highlighter, marker: Brush, eraser: Eraser, laser: Crosshair, text: Type,
   rect: RectangleHorizontal, bookmark: Bookmark, underline: Underline, strike: Strikethrough, circle: Circle, line: Slash,
   rotate: RotateCw, file: FileText, upload: Upload, keyboard: Keyboard, textSize: ALargeSmall, info: Info, error: CircleAlert,
-  ok: CircleCheck, warn: TriangleAlert, contrast: Contrast,
+  ok: CircleCheck, warn: TriangleAlert, contrast: Contrast, redo: Redo2, lasso: Lasso, ruler: Ruler, spread: BookOpen,
+  more: EllipsisVertical, print: Printer, image: Image, extract: FileOutput, flatten: Layers, ellipse: Circle, arrow: ArrowUpRight,
+  bookmarkAdd: BookmarkPlus, rename: PencilLine, recent: Clock, saveAs: Save, eye: Eye,
 };
 
 const attrs = (o) => Object.entries(o).map(([k, v]) => `${k}="${String(v).replace(/"/g, '&quot;')}"`).join(' ');

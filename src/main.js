@@ -1,22 +1,38 @@
 import '@fontsource-variable/inter';
 import './style.css';
 import { ic, hydrateIcons } from './icons.js';
-import { initUI, toast, setBusy, confirmDialog } from './ui.js';
+import { initUI, toast, setBusy, confirmDialog, promptDialog } from './ui.js';
 import * as pdfjs from 'pdfjs-dist';
 import workerUrl from 'pdfjs-dist/build/pdf.worker.min.mjs?url';
+import interUrl from '@fontsource-variable/inter/files/inter-latin-ext-wght-normal.woff2?url';
 import { PDFDocument, ParseSpeeds } from 'pdf-lib';
-import { readAnnots, applyChanges, makeInk, makeHighlight, newId } from './annots.js';
-import { insertBlank, insertPdf, removePage, rotatePage, duplicatePage, movePage } from './pageops.js';
-import { kvGet, kvSet, kvDel, loadPrefs, savePrefs, serializeDraft, applyDraft } from './session.js';
+import {
+  readAnnots, applyChanges, makeInk, makeHighlight, makeTextHighlight, makeShape, arrowHead, newId, cloneAnnot, recolor, eraseInk,
+  flattenAnnots, setTextFont,
+} from './annots.js';
+import {
+  insertBlank, insertPdf, removePage, removePages, rotatePage, duplicatePage, movePage, extractPages, writeOutline,
+} from './pageops.js';
+import { kvGet, kvSet, kvDel, loadPrefs, savePrefs, serializeDraft, applyDraft, fingerprint } from './session.js';
+import { textQuads, findInItems } from './text.js';
 
 pdfjs.GlobalWorkerOptions.workerSrc = workerUrl;
 hydrateIcons();
 initUI();
 
+// Font incorporato nel testo libero: Arial di Windows nell'app (piccolo, sottoinsieme), Inter (latino esteso) nel browser.
+setTextFont(async () => {
+  if (window.native) {
+    const b = await window.native.systemFont();
+    if (b) return { bytes: new Uint8Array(b), subset: true };
+  }
+  return { bytes: new Uint8Array(await (await fetch(interUrl)).arrayBuffer()), subset: false };
+});
+
 const $ = (id) => document.getElementById(id);
 const hintEl = document.getElementById('hint');
 const els = {
-  pages: $('pages'), save: $('save'), undo: $('undo'), tabs: $('tabs'), newTab: $('newTab'),
+  pages: $('pages'), save: $('save'), undo: $('undo'), redo: $('redo'), tabs: $('tabs'), newTab: $('newTab'),
   pager: $('pager'), pageNo: $('pageNo'), pageTot: $('pageTot'), zoomPct: $('zoomPct'), fav: $('fav'),
   slots: $('slots'), pop: $('pop'), popSw: $('popSw'), popW: $('popW'), file: $('file'),
 };
@@ -35,19 +51,20 @@ const DEFAULT_SLOTS = [
   { type: 'laser', color: [0.95, 0.1, 0.1], width: 3 },
   { type: 'text', color: [0, 0, 0], width: 12 },
   { type: 'rect', color: [0.9, 0.15, 0.15], width: 1.5 },
-  { type: 'eraser', color: [0.6, 0.6, 0.6], width: 6 },
+  { type: 'arrow', color: [0.9, 0.15, 0.15], width: 1.5 },
+  { type: 'eraser', style: 'stroke', color: [0.6, 0.6, 0.6], width: 6 },
 ];
-const NAMES = {
-  pen: 'Penna', marker: 'Evidenziatore a mano libera', highlighter: 'Evidenziatore testo', laser: 'Puntatore laser',
-  text: 'Testo', rect: 'Rettangolo', eraser: 'Gomma',
-};
 const STYLES = { pressure: 'Penna a pressione', fixed: 'Penna fissa', calligraphy: 'Stilografica (punta piatta)' };
+const ERASER_STYLES = { stroke: 'Cancella tratti interi', partial: 'Cancella parte del tratto' };
 const INK_TOOLS = new Set(['pen', 'marker']);
+const SHAPE_TOOLS = new Set(['rect', 'ellipse', 'line', 'arrow']);
 
 const state = {
   lib: null, doc: null, pages: [], scale: 1, tool: 'view', slot: -1, slots: loadSlots(), lock: true,
   dark: true, eco: false, userEco: false, finger: false, grid: '', dirty: false, name: 'documento.pdf', handle: null, path: null, fitMode: null,
-  undo: [], encrypted: false, ui: 'm', contrast: false,
+  undo: [], redo: [], encrypted: false, ui: 'm', contrast: false, spread: false, realImg: false,
+  sel: null, // selezione a lazo: { p, items, box }
+  search: null, // { q, hits: [{ page, quads }], cur }
 };
 
 // Interruttore accessibile (role="switch"): stato visivo e aria-checked insieme.
@@ -66,15 +83,19 @@ const applyUi = () => {
   if (typeof pr.grid === 'string') state.grid = pr.grid;
   if (['s', 'm', 'l', 'xl'].includes(pr.ui)) state.ui = pr.ui;
   if (typeof pr.contrast === 'boolean') state.contrast = pr.contrast;
+  if (typeof pr.spread === 'boolean') state.spread = pr.spread;
+  if (typeof pr.realImg === 'boolean') state.realImg = pr.realImg;
   setSwitch($('dark'), state.dark);
   setSwitch($('eco'), state.eco);
   setSwitch($('contrast'), state.contrast);
+  setSwitch($('realImg'), state.realImg);
   $('grid').value = state.grid;
   $('uiSize').value = state.ui;
   applyUi();
 }
 const persistPrefs = () => savePrefs({
   dark: state.dark, eco: state.userEco ? state.eco : undefined, lock2: state.lock, grid: state.grid, ui: state.ui, contrast: state.contrast,
+  spread: state.spread, realImg: state.realImg,
 });
 
 function loadSlots() {
@@ -98,8 +119,9 @@ const setStatus = (t) => {
 };
 
 /* ---------- colori (adattati al nero OLED solo in visualizzazione) ---------- */
+let paperColors = false; // stampa / esportazione: colori originali anche con la pagina scura
 function disp(c) {
-  if (!state.dark) return c;
+  if (!state.dark || paperColors) return c;
   if (Math.max(...c) - Math.min(...c) < 0.15) return c.map((v) => 1 - v); // nero → bianco
   const L = 0.3 * c[0] + 0.59 * c[1] + 0.11 * c[2];
   return L < 0.3 ? c.map((v) => v + (1 - v) * 0.55) : c; // colori scuri (blu notte...) schiariti per restare leggibili
@@ -111,31 +133,39 @@ const docs = [];
 let active = null;
 let docSeq = 0;
 let userOpened = false; // vero appena l'utente (o Esplora file) apre un PDF: il ripristino della sessione non deve scavalcarlo
-const draftKey = (name, size) => `draft:${name}|${size}`;
+// Chiave della bozza: nome + dimensione + impronta del contenuto (due file omonimi della stessa dimensione non si confondono).
+const draftKey = (name, size, fp) => `draft:${name}|${size}${fp ? `|${fp}` : ''}`;
 
 // Copia lo stato "vivo" della vista nel documento attivo prima di cambiare scheda.
 function saveActive() {
   if (!active) return;
   Object.assign(active, {
-    scale: state.scale, scroll: els.pages.scrollTop, ratio: els.pages.scrollTop / (els.pages.scrollHeight || 1), undo: state.undo, dirty: state.dirty, fitMode: state.fitMode,
-    name: state.name, path: state.path, handle: state.handle,
+    scale: state.scale, scroll: els.pages.scrollTop, ratio: els.pages.scrollTop / (els.pages.scrollHeight || 1), undo: state.undo, redo: state.redo,
+    dirty: state.dirty, fitMode: state.fitMode, name: state.name, path: state.path, handle: state.handle,
   });
 }
 
 function detachView() {
   for (const p of state.pages) { p.task?.cancel(); p.gen++; if (p.laserRaf) cancelAnimationFrame(p.laserRaf); }
   io.disconnect();
+  clearSel();
   els.pages.replaceChildren();
 }
 
+const updateHistoryButtons = () => {
+  els.undo.disabled = !state.undo.some((o) => o.type !== 'draft');
+  els.redo.disabled = !state.redo.length;
+};
+
 function showEmpty() {
   detachView();
-  Object.assign(state, { lib: null, doc: null, task: null, pages: [], undo: [], dirty: false, name: 'documento.pdf', path: null, handle: null });
+  Object.assign(state, { lib: null, doc: null, task: null, pages: [], undo: [], redo: [], dirty: false, name: 'documento.pdf', path: null, handle: null, search: null });
   els.pages.append(hintEl);
   els.pager.hidden = true; setChrome(false);
   buildThumbs();
-  setDirty(false); els.save.disabled = true; els.undo.disabled = true;
+  setDirty(false); els.save.disabled = true; updateHistoryButtons();
   renderTabs();
+  renderRecent();
   setStatus('');
 }
 
@@ -144,11 +174,12 @@ function activate(rec, scrollTop) {
   detachView();
   active = rec;
   Object.assign(state, {
-    lib: rec.lib, doc: rec.doc, task: rec.task, pages: rec.pages, scale: rec.scale, undo: rec.undo,
-    name: rec.name, path: rec.path, handle: rec.handle, size: rec.size, encrypted: rec.encrypted, fitMode: rec.fitMode ?? null,
+    lib: rec.lib, doc: rec.doc, task: rec.task, pages: rec.pages, scale: rec.scale, undo: rec.undo, redo: rec.redo,
+    name: rec.name, path: rec.path, handle: rec.handle, size: rec.size, encrypted: rec.encrypted, fitMode: rec.fitMode ?? null, search: null,
   });
+  thumbSel.clear();
   state.dirty = rec.dirty;
-  els.undo.disabled = !state.undo.some((o) => o.type !== 'draft');
+  updateHistoryButtons();
   els.save.disabled = !state.dirty || state.encrypted;
   buildPages();
   els.pages.scrollTop = scrollTop ?? rec.scroll ?? 0;
@@ -219,7 +250,7 @@ async function closeDoc(rec) {
   if (i < 0) return;
   if (rec === active) active = null; // evita di risalvare lo stato in un documento rimosso
   docs.splice(i, 1);
-  kvDel(draftKey(rec.name, rec.size));
+  kvDel(rec.dkey);
   if (!docs.length) { showEmpty(); rec.task?.destroy(); return; }
   if (!active) activate(docs[Math.min(i, docs.length - 1)]);
   else renderTabs();
@@ -241,12 +272,17 @@ async function loadBytes(bytes, opts = {}) {
   const prev = opts.replace ? active : null;
   const name = opts.name ?? prev?.name ?? state.name;
   const origSize = opts.structural ? prev.origSize : bytes.length; // dimensione del file su disco: chiave della bozza
+  const fp = opts.structural ? prev.fp : fingerprint(bytes);
+  const dkey = draftKey(name, origSize, fp);
   let edited = opts.structural ? bytes : null;
+  if (opts.restore) edited = opts.restore.edited;
 
-  // Bozza: modifiche non salvate di una sessione precedente dello stesso file (anche pagine aggiunte/rimosse)
+  // Bozza: modifiche non salvate di una sessione precedente dello stesso file (anche pagine aggiunte/rimosse).
+  // Le bozze delle versioni precedenti (chiave senza impronta) vengono ancora lette.
   let draft = null;
   if (!opts.noDraft && !opts.structural) {
-    const d = await kvGet(draftKey(name, origSize));
+    let d = await kvGet(dkey);
+    if (!d) { d = await kvGet(draftKey(name, origSize)); if (d) kvDel(draftKey(name, origSize)); }
     if (d && d.name === name && d.origSize === origSize) { draft = d; if (d.bytes) { edited = d.bytes; bytes = d.bytes; } }
   }
 
@@ -275,16 +311,24 @@ async function loadBytes(bytes, opts = {}) {
     key: null, task: null, gen: 0, d: 1, stroke: null, rectStart: null, erased: null, raf: 0,
   }));
   pages.forEach((p) => p.annots.forEach((a, i) => { a.ei = i; }));
+  // Le annotazioni che l'app disegna da sé non vanno disegnate anche da pdf.js; tutte le altre (timbri, firme,
+  // note, campi modulo...) sì, così il documento resta fedele anche quando contiene tipi non modificabili.
+  for (const p of pages) for (const a of p.annots) if (a.ref) doc.annotationStorage.setValue(refId(a.ref), { noView: true });
   perf('load: readAnnots');
 
   const path = 'path' in opts ? opts.path : prev?.path ?? null;
   const handle = 'handle' in opts ? opts.handle : prev?.handle ?? null;
   const rec = {
-    id: ++docSeq, lib, task, doc, pages, size: bytes.length, origSize, edited, encrypted: lib.isEncrypted, undo: [],
-    dirty: !!opts.structural || !!draft, scroll: 0, fitMode: opts.replace ? state.fitMode : opts.view ? opts.view.fit ?? null : 'width', pendingRatio: opts.view?.ratio ?? null, name, path, handle, scale: 1,
-    bytes: path || handle ? null : bytes, // senza percorso il contenuto va conservato per ripristinare la sessione
+    id: ++docSeq, lib, task, doc, pages, size: bytes.length, origSize, fp, dkey, edited, encrypted: lib.isEncrypted,
+    undo: opts.restore?.undo ?? [], redo: opts.restore?.redo ?? [],
+    dirty: opts.restore ? opts.restore.dirty : !!opts.structural || !!draft, scroll: 0, fitMode: opts.replace ? state.fitMode : opts.view ? opts.view.fit ?? null : 'width', pendingRatio: opts.view?.ratio ?? null, name, path, handle, scale: 1,
+    src: bytes, // byte da cui è stato caricato: base per annullare le operazioni sulle pagine e per le esportazioni
+    // senza percorso il contenuto originale va conservato per ripristinare la sessione (le modifiche stanno nella bozza)
+    bytes: path || handle ? null : opts.structural ? prev.bytes : bytes,
   };
   if (draft) { applyDraft(pages, draft.pages); rec.undo = [{ type: 'draft' }]; }
+  if (opts.restore?.pages) applyDraft(pages, opts.restore.pages);
+  if (!opts.background && !opts.replace) addRecent(rec);
 
   const w0 = pages[0].proxy.getViewport({ scale: 1 }).width;
   const pcs = getComputedStyle(els.pages);
@@ -314,7 +358,9 @@ function buildPages() {
     p.base = document.createElement('canvas');
     p.ov = document.createElement('canvas'); p.ov.className = 'ov';
     p.gridEl = document.createElement('canvas'); p.gridEl.className = 'gridov';
-    p.el.append(p.base, p.gridEl, p.ov);
+    p.textEl = document.createElement('div'); p.textEl.className = 'textLayer';
+    p.linkEl = document.createElement('div'); p.linkEl.className = 'links';
+    p.el.append(p.base, p.gridEl, p.ov, p.textEl, p.linkEl);
     p.el.dataset.i = p.index;
     attach(p);
     els.pages.append(p.el);
@@ -324,16 +370,24 @@ function buildPages() {
 
 function layout() {
   lastPager = -1;
+  els.pages.classList.toggle('spread', state.spread && state.pages.length > 1);
   for (const p of state.pages) {
     p.vp = p.proxy.getViewport({ scale: state.scale });
     p.el.style.width = `${p.vp.width}px`;
     p.el.style.height = `${p.vp.height}px`;
+    p.el.style.setProperty('--total-scale-factor', String(state.scale));
     p.task?.cancel(); p.gen++; p.key = null;
   }
   els.zoomPct.textContent = `${Math.round(state.scale * 100)}%`;
+  if (state.sel) placeSelbar();
+  if (ruler.on) placeRuler();
   io.disconnect();
   for (const p of state.pages) io.observe(p.el);
 }
+
+const refId = (r) => (r.generationNumber ? `${r.objectNumber}R${r.generationNumber}` : `${r.objectNumber}R`);
+// Testo della pagina (cache): ricerca, evidenziatore agganciato al testo, livello di selezione.
+const textOf = (p) => (p.text ??= p.proxy.getTextContent().catch(() => ({ items: [], styles: {} })));
 
 /* ---------- rendering a richiesta (nessun ciclo continuo) ---------- */
 const io = new IntersectionObserver((entries) => {
@@ -345,9 +399,12 @@ const io = new IntersectionObserver((entries) => {
   updatePager();
 }, { root: els.pages, rootMargin: '120% 0px', threshold: [0, 0.5] });
 
+const RENDER_MODE = pdfjs.AnnotationMode.ENABLE_STORAGE; // annotazioni non gestite dall'app disegnate da pdf.js
+
 async function render(p) {
+  if (pinch) return; // durante il pizzico la pagina si limita a scalare il bitmap esistente
   const d = dpr();
-  const key = `${state.scale}|${state.dark}|${d}`;
+  const key = `${state.scale}|${state.dark}|${d}|${state.realImg}`;
   if (p.key === key) return;
   p.task?.cancel();
   const gen = ++p.gen;
@@ -357,10 +414,12 @@ async function render(p) {
   c.width = Math.floor(vp.width); c.height = Math.floor(vp.height);
   const ctx = c.getContext('2d', { alpha: false });
   try {
-    p.task = p.proxy.render({ canvasContext: ctx, canvas: c, viewport: vp, annotationMode: pdfjs.AnnotationMode.DISABLE });
+    const keep = state.dark && state.realImg ? await imageRects(p) : null;
+    if (gen !== p.gen) return;
+    p.task = p.proxy.render({ canvasContext: ctx, canvas: c, viewport: vp, annotationMode: RENDER_MODE });
     await p.task.promise;
     if (gen !== p.gen) return;
-    if (state.dark) darken(c, ctx);
+    if (state.dark) darken(c, ctx, keep && keep.map((r) => [...vp.convertToViewportPoint(r[0], r[1]), ...vp.convertToViewportPoint(r[2], r[3])]));
   } catch (e) {
     if (e?.name !== 'RenderingCancelledException') console.error(e);
     return;
@@ -369,15 +428,25 @@ async function render(p) {
   p.ov.width = c.width; p.ov.height = c.height;
   p.gridEl.width = c.width; p.gridEl.height = c.height;
   draw(p); drawGrid(p);
+  buildLinks(p);
+  if (state.tool === 'view') buildTextLayer(p);
 }
 
 function release(p) {
   p.task?.cancel(); p.gen++; p.key = null;
   p.base.width = p.base.height = 0; p.ov.width = p.ov.height = 0; p.gridEl.width = p.gridEl.height = 0;
+  p.textEl.replaceChildren(); p.textKey = null; p.textLayer?.cancel?.(); p.textLayer = null;
 }
 
 // Inversione una tantum del bitmap: niente filtri CSS attivi durante lo scorrimento.
-function darken(c, ctx) {
+// keep: rettangoli (pixel) delle immagini da lasciare con i colori originali.
+function darken(c, ctx, keep) {
+  let orig = null;
+  if (keep?.length) {
+    orig = document.createElement('canvas');
+    orig.width = c.width; orig.height = c.height;
+    orig.getContext('2d').drawImage(c, 0, 0);
+  }
   ctx.save();
   ctx.globalCompositeOperation = 'difference';
   ctx.fillStyle = '#fff';
@@ -393,7 +462,86 @@ function darken(c, ctx) {
     ctx.restore();
     tmp.width = tmp.height = 0;
   }
+  if (orig) {
+    for (const r of keep) {
+      const x = Math.max(0, Math.floor(Math.min(r[0], r[2]))), y = Math.max(0, Math.floor(Math.min(r[1], r[3])));
+      const w = Math.min(c.width, Math.ceil(Math.max(r[0], r[2]))) - x, h = Math.min(c.height, Math.ceil(Math.max(r[1], r[3]))) - y;
+      if (w > 2 && h > 2) ctx.drawImage(orig, x, y, w, h, x, y, w, h);
+    }
+    orig.width = orig.height = 0;
+  }
 }
+
+// Posizione delle immagini della pagina (coordinate PDF), dalla lista delle operazioni di disegno.
+// Le immagini che coprono quasi tutta la pagina (scansioni) restano escluse: devono diventare scure.
+const mul = (m, n) => [m[0] * n[0] + m[2] * n[1], m[1] * n[0] + m[3] * n[1], m[0] * n[2] + m[2] * n[3], m[1] * n[2] + m[3] * n[3], m[0] * n[4] + m[2] * n[5] + m[4], m[1] * n[4] + m[3] * n[5] + m[5]];
+function imageRects(p) {
+  return (p.imgRects ??= (async () => {
+    const { OPS } = pdfjs;
+    const list = await p.proxy.getOperatorList({ annotationMode: pdfjs.AnnotationMode.DISABLE });
+    const [vx0, vy0, vx1, vy1] = p.proxy.view, area = (vx1 - vx0) * (vy1 - vy0);
+    const out = [], stack = [];
+    let m = [1, 0, 0, 1, 0, 0];
+    for (let i = 0; i < list.fnArray.length; i++) {
+      const fn = list.fnArray[i], args = list.argsArray[i];
+      if (fn === OPS.save) stack.push(m);
+      else if (fn === OPS.restore) m = stack.pop() || m;
+      else if (fn === OPS.transform) m = mul(m, args);
+      else if (fn === OPS.paintFormXObjectBegin) { stack.push(m); if (args?.[0]) m = mul(m, args[0]); }
+      else if (fn === OPS.paintFormXObjectEnd) m = stack.pop() || m;
+      else if (fn === OPS.paintImageXObject || fn === OPS.paintInlineImageXObject) {
+        const xs = [m[4], m[0] + m[4], m[2] + m[4], m[0] + m[2] + m[4]], ys = [m[5], m[1] + m[5], m[3] + m[5], m[1] + m[3] + m[5]];
+        const r = [Math.min(...xs), Math.min(...ys), Math.max(...xs), Math.max(...ys)];
+        if ((r[2] - r[0]) * (r[3] - r[1]) < area * 0.8) out.push(r);
+      }
+    }
+    return out;
+  })().catch(() => []));
+}
+
+// Link del PDF (indice interno e indirizzi web): cliccabili in modalità Sfoglia.
+async function buildLinks(p) {
+  const gen = p.gen;
+  p.linkData ??= await p.proxy.getAnnotations({ intent: 'display' }).then((l) => l.filter((a) => a.subtype === 'Link' && (a.url || a.dest))).catch(() => []);
+  if (gen !== p.gen || !p.linkData.length) { if (!p.linkData?.length) p.linkEl.replaceChildren(); return; }
+  p.linkEl.replaceChildren(...p.linkData.map((a) => {
+    const [x0, y0, x1, y1] = rectBox(p.vp, a.rect);
+    const el = document.createElement('a');
+    Object.assign(el.style, { left: `${x0}px`, top: `${y0}px`, width: `${x1 - x0}px`, height: `${y1 - y0}px` });
+    if (a.url) { el.href = a.url; el.title = a.url; el.rel = 'noopener noreferrer'; } else { el.href = '#'; el.title = 'Vai alla destinazione'; }
+    el.addEventListener('click', (e) => {
+      e.preventDefault();
+      if (a.url) { if (window.native) window.native.openExternal(a.url); else window.open(a.url, '_blank', 'noopener'); } else goDest(a.dest);
+    });
+    return el;
+  }));
+}
+
+async function goDest(dest) {
+  try {
+    if (typeof dest === 'string') dest = await state.doc.getDestination(dest);
+    if (Array.isArray(dest)) goPage((typeof dest[0] === 'number' ? dest[0] : await state.doc.getPageIndex(dest[0])) + 1);
+  } catch { /* destinazione non valida */ }
+}
+
+// Livello di testo trasparente sopra la pagina: selezione e copia (Ctrl+C) come in un lettore normale.
+async function buildTextLayer(p) {
+  const key = `${state.scale}`;
+  if (p.textKey === key || !p.vp) return;
+  p.textKey = key;
+  p.textLayer?.cancel?.();
+  p.textEl.replaceChildren();
+  const content = await textOf(p);
+  if (p.textKey !== key) return;
+  p.textLayer = new pdfjs.TextLayer({ textContentSource: content, container: p.textEl, viewport: p.vp });
+  try { await p.textLayer.render(); } catch { /* annullato */ }
+}
+document.addEventListener('selectionchange', () => {
+  // durante la selezione il fondo del livello di testo segue il puntatore (come nel visualizzatore di pdf.js)
+  const s = document.getSelection();
+  for (const el of document.querySelectorAll('.textLayer.selecting')) el.classList.remove('selecting');
+  if (s && !s.isCollapsed && s.anchorNode) s.anchorNode.parentElement?.closest?.('.textLayer')?.classList.add('selecting');
+});
 
 /* ---------- griglia sovrapposta ---------- */
 function drawGrid(p) {
@@ -416,9 +564,28 @@ function draw(p) {
   const ctx = c.getContext('2d');
   ctx.setTransform(p.d, 0, 0, p.d, 0, 0);
   ctx.clearRect(0, 0, c.width, c.height);
-  for (const a of p.annots) if (!a.deleted) drawAnnot(ctx, p.vp, a);
+  const sel = state.sel?.p === p ? state.sel : null;
+  const moving = sel?.M; // durante lo spostamento le annotazioni selezionate si vedono nella nuova posizione
+  for (const a of p.annots) if (!a.deleted && !(moving && sel.items.includes(a))) drawAnnot(ctx, p.vp, a);
+  if (moving) {
+    const vt = p.vp.transform;
+    ctx.save();
+    ctx.transform(...mul(vt, mul(matOf(moving), invert(vt))));
+    for (const a of sel.items) drawAnnot(ctx, p.vp, a);
+    ctx.restore();
+  }
+  if (state.search?.byPage.has(p.index)) drawHits(ctx, p);
+  if (sel) drawSel(ctx, p, sel);
   if (p.live) drawLive(ctx, p);
   if (p.trail) drawTrail(ctx, p);
+}
+
+function drawHits(ctx, p) {
+  const { hits, cur, byPage } = state.search;
+  for (const k of byPage.get(p.index)) {
+    ctx.fillStyle = k === cur ? 'rgba(255, 170, 40, .55)' : 'rgba(61, 220, 159, .32)';
+    for (const q of hits[k].quads) { const [x0, y0, x1, y1] = quadBox(p.vp, q); ctx.fillRect(x0 - 1, y0, x1 - x0 + 2, y1 - y0); }
+  }
 }
 
 // Puntatore laser: traccia temporanea che svanisce (il ciclo rAF vive solo finché c'è una traccia visibile).
@@ -539,10 +706,14 @@ function drawAnnot(ctx, vp, a) {
   } else if (a.subtype === 'Line' && a.line) {
     ctx.strokeStyle = rgba(a.color, a.ca); ctx.lineWidth = Math.max(1, a.width * s);
     ctx.beginPath(); ctx.moveTo(...vp.convertToViewportPoint(a.line[0], a.line[1])); ctx.lineTo(...vp.convertToViewportPoint(a.line[2], a.line[3])); ctx.stroke();
+    if (a.le?.[1] === 'OpenArrow') {
+      const [h1, tip, h2] = arrowHead(...a.line.slice(0, 4), a.width).map(([x, y]) => vp.convertToViewportPoint(x, y));
+      ctx.beginPath(); ctx.moveTo(...h1); ctx.lineTo(...tip); ctx.lineTo(...h2); ctx.stroke();
+    }
   } else if (a.subtype === 'FreeText') {
     const [x0, y0, x1] = rectBox(vp, a.rect);
     ctx.fillStyle = rgba(a.color, 1); ctx.textBaseline = 'top';
-    const fs = a.fontSize * s; ctx.font = `${fs}px Helvetica, Arial, sans-serif`;
+    const fs = a.fontSize * s; ctx.font = `${fs}px ${TEXT_FONT}`;
     let y = y0 + 2 * s;
     for (const para of (a.text || '').split(/\r?\n/)) {
       let line = '';
@@ -573,16 +744,52 @@ function drawLive(ctx, p) {
     L.pts.forEach(([x, y], i) => (i ? ctx.lineTo(x, y) : ctx.moveTo(x, y)));
     if (L.pts.length === 1) ctx.lineTo(L.pts[0][0] + 0.01, L.pts[0][1]);
     ctx.stroke();
-  } else if (L.kind === 'rect') {
+  } else if (SHAPE_TOOLS.has(L.kind)) {
     ctx.strokeStyle = rgba(L.color, 1); ctx.lineWidth = Math.max(1, L.width * state.scale);
-    ctx.strokeRect(L.x0, L.y0, L.x1 - L.x0, L.y1 - L.y0);
+    ctx.beginPath();
+    if (L.kind === 'rect') ctx.rect(L.x0, L.y0, L.x1 - L.x0, L.y1 - L.y0);
+    else if (L.kind === 'ellipse') ctx.ellipse((L.x0 + L.x1) / 2, (L.y0 + L.y1) / 2, Math.abs(L.x1 - L.x0) / 2, Math.abs(L.y1 - L.y0) / 2, 0, 0, Math.PI * 2);
+    else {
+      ctx.moveTo(L.x0, L.y0); ctx.lineTo(L.x1, L.y1);
+      if (L.kind === 'arrow') { const [h1, tip, h2] = arrowHead(L.x0, L.y0, L.x1, L.y1, L.width * state.scale); ctx.moveTo(...h1); ctx.lineTo(...tip); ctx.lineTo(...h2); }
+    }
+    ctx.stroke();
+  } else if (L.kind === 'lasso') {
+    ctx.strokeStyle = '#3ddc9f'; ctx.fillStyle = 'rgba(61, 220, 159, .08)'; ctx.lineWidth = 1.5; ctx.setLineDash([5, 4]);
+    ctx.beginPath();
+    L.pts.forEach(([x, y], i) => (i ? ctx.lineTo(x, y) : ctx.moveTo(x, y)));
+    ctx.closePath(); ctx.fill(); ctx.stroke();
   }
   ctx.restore();
 }
 
+// Riquadro della selezione con le quattro maniglie per ridimensionare.
+const HANDLE = 9;
+function selBox(p, sel) {
+  const r = sel.M ? mapRect(sel.box, sel.M) : sel.box;
+  const [x0, y0, x1, y1] = rectBox(p.vp, r);
+  return [x0 - 4, y0 - 4, x1 + 4, y1 + 4];
+}
+function drawSel(ctx, p, sel) {
+  const [x0, y0, x1, y1] = selBox(p, sel);
+  ctx.save();
+  ctx.strokeStyle = '#3ddc9f'; ctx.lineWidth = 1.5; ctx.setLineDash([6, 4]);
+  ctx.strokeRect(x0, y0, x1 - x0, y1 - y0);
+  ctx.setLineDash([]); ctx.fillStyle = '#000';
+  for (const [hx, hy] of [[x0, y0], [x1, y0], [x0, y1], [x1, y1]]) {
+    ctx.beginPath(); ctx.arc(hx, hy, HANDLE / 2 + 1, 0, Math.PI * 2); ctx.fill(); ctx.stroke();
+  }
+  ctx.restore();
+}
+const unionRect = (list) => [
+  Math.min(...list.map((a) => a.rect[0])), Math.min(...list.map((a) => a.rect[1])),
+  Math.max(...list.map((a) => a.rect[2])), Math.max(...list.map((a) => a.rect[3])),
+];
+
 const requestDraw = (p) => { if (!p.raf) p.raf = requestAnimationFrame(() => { p.raf = 0; draw(p); }); };
 
 /* ---------- interazione ---------- */
+const TEXT_FONT = window.native ? 'Arial, Helvetica, sans-serif' : '"Inter Variable", Helvetica, Arial, sans-serif'; // lo stesso font incorporato nel PDF
 const pos = (p, e) => { const r = p.ov.getBoundingClientRect(); return [e.clientX - r.left, e.clientY - r.top]; };
 const toPdf = (p, x, y) => p.vp.convertToPdfPoint(x, y);
 const slotCur = () => state.slots[state.slot];
@@ -601,7 +808,7 @@ function attach(p) {
 }
 
 function onDown(p, e) {
-  if (state.tool === 'view' || state.encrypted) return;
+  if (state.tool === 'view' || state.encrypted || pinch) return;
   if (e.pointerType === 'mouse' && e.button !== 0) return;
   if (e.pointerType === 'pen' && e.button === 2) return; // tasto laterale della penna
   if (e.pointerType === 'touch' && !state.finger && state.tool !== 'text') {
@@ -613,26 +820,36 @@ function onDown(p, e) {
   e.preventDefault();
   p.ov.setPointerCapture(e.pointerId);
   p.tool = e.pointerType === 'pen' && (e.buttons & 32) ? 'eraser' : state.tool; // la coda della penna cancella
-  const [x, y] = pos(p, e);
+  if (p.tool !== 'lasso') clearSel();
+  let [x, y] = pos(p, e);
   const s = slotCur();
   switch (p.tool) {
-    case 'pen': p.stroke = { pts: [[x, y, e.pressure || 0.5]], last: [x, y] }; break;
+    case 'pen':
+      p.snap = rulerSnap(p, x, y);
+      if (p.snap) [x, y] = p.snap(x, y);
+      p.stroke = { pts: [[x, y, e.pressure || 0.5]], last: [x, y] };
+      break;
     case 'marker':
+      p.snap = rulerSnap(p, x, y);
+      if (p.snap) [x, y] = p.snap(x, y);
       p.stroke = { pts: [[x, y, 0.5]] };
       p.live = { kind: 'marker', pts: p.stroke.pts, color: s.color, width: s.width, opacity: s.opacity };
       requestDraw(p);
       break;
     case 'laser': p.trail = [{ x, y, t: performance.now() }]; p.laserDown = true; laserLoop(p); break;
     case 'highlighter': p.stroke = { pts: [[x, y]] }; p.live = { kind: 'highlighter', pts: p.stroke.pts, color: s.color, width: s.width }; requestDraw(p); break;
-    case 'rect': p.rectStart = [x, y]; p.live = { kind: 'rect', x0: x, y0: y, x1: x, y1: y, color: s.color, width: s.width }; break;
-    case 'eraser': p.erased = []; eraseAt(p, x, y); break;
-    case 'text': openText(p, x, y); break;
+    case 'rect': case 'ellipse': case 'line': case 'arrow':
+      p.rectStart = [x, y]; p.live = { kind: p.tool, x0: x, y0: y, x1: x, y1: y, color: s.color, width: s.width };
+      break;
+    case 'eraser': p.erased = []; p.eraseAdded = []; eraseAt(p, x, y); break;
+    case 'text': openText(p, x, y, textHit(p, x, y)); break;
+    case 'lasso': lassoDown(p, x, y); break;
     default: break;
   }
 }
 
 function onMove(p, e) {
-  if (state.tool === 'view' || !p.ov.hasPointerCapture(e.pointerId)) return; // ignora il semplice passaggio del cursore
+  if (state.tool === 'view' || pinch || !p.ov.hasPointerCapture(e.pointerId)) return; // ignora il semplice passaggio del cursore
   if (p.pan && p.pan.id === e.pointerId) {
     els.pages.scrollLeft = p.pan.sx - (e.clientX - p.pan.x);
     els.pages.scrollTop = p.pan.sy - (e.clientY - p.pan.y);
@@ -641,13 +858,14 @@ function onMove(p, e) {
   const evs = e.getCoalescedEvents?.() || [e];
   const s = slotCur();
   const tool = p.tool || state.tool;
+  const at = (ev) => (p.snap ? p.snap(...pos(p, ev)) : pos(p, ev));
   if (p.stroke && tool === 'pen') {
     // Anteprima incrementale (un solo segmento per evento): il poligono definitivo si calcola al rilascio.
     const ctx = p.ov.getContext('2d');
     ctx.setTransform(p.d, 0, 0, p.d, 0, 0);
     ctx.lineCap = 'round'; ctx.strokeStyle = rgba(s.color, s.opacity ?? 1); ctx.fillStyle = ctx.strokeStyle;
     for (const ev of evs) {
-      const [x, y] = pos(p, ev);
+      const [x, y] = at(ev);
       const pr = ev.pressure || 0.5;
       const [lx, ly] = p.stroke.last;
       if (s.style === 'calligraphy') {
@@ -670,40 +888,55 @@ function onMove(p, e) {
     const t = performance.now();
     for (const ev of evs) p.trail.push({ x: pos(p, ev)[0], y: pos(p, ev)[1], t });
   } else if (p.stroke && (tool === 'highlighter' || tool === 'marker')) {
-    for (const ev of evs) p.stroke.pts.push(tool === 'marker' ? [...pos(p, ev), 0.5] : pos(p, ev));
+    for (const ev of evs) p.stroke.pts.push(tool === 'marker' ? [...at(ev), 0.5] : pos(p, ev));
     requestDraw(p);
   } else if (p.rectStart) {
-    const [x, y] = pos(p, e);
+    let [x, y] = pos(p, e);
+    if (e.shiftKey) [x, y] = constrain(tool, p.rectStart, x, y);
     Object.assign(p.live, { x1: x, y1: y });
     requestDraw(p);
   } else if (p.erased) {
     for (const ev of evs) eraseAt(p, ...pos(p, ev));
+  } else if (p.lasso) {
+    lassoMove(p, e, evs);
   }
+}
+
+// Maiusc: quadrato / cerchio, linee a multipli di 15°.
+function constrain(tool, [x0, y0], x, y) {
+  if (tool === 'line' || tool === 'arrow') {
+    const len = Math.hypot(x - x0, y - y0), a = Math.round(Math.atan2(y - y0, x - x0) / (Math.PI / 12)) * (Math.PI / 12);
+    return [x0 + len * Math.cos(a), y0 + len * Math.sin(a)];
+  }
+  const d = Math.max(Math.abs(x - x0), Math.abs(y - y0));
+  return [x0 + Math.sign(x - x0 || 1) * d, y0 + Math.sign(y - y0 || 1) * d];
 }
 
 function onUp(p, e) {
   if (p.pan && p.pan.id === e.pointerId) { p.pan = null; return; }
+  if (p.lasso) { lassoUp(p); return; }
   if (!p.stroke && !p.rectStart && !p.erased && !p.trail) return; // pointerup di semplice navigazione
   const s = slotCur();
   const tool = p.tool || state.tool;
   let made = null;
-  p.tool = null;
+  p.tool = null; p.snap = null;
   if (p.trail) { p.laserDown = false; return; } // il laser svanisce da solo (laserLoop)
   if (p.stroke && INK_TOOLS.has(tool)) {
     const pts = p.stroke.pts.map(([x, y, pr]) => [...toPdf(p, x, y), pr]);
     made = makeInk([{ pts }], s.color, s.width, { style: s.style, opacity: s.opacity, smooth: s.smooth, straighten: s.straighten });
   } else if (p.stroke && tool === 'highlighter') {
-    made = makeHighlight(p.stroke.pts.map(([x, y]) => toPdf(p, x, y)), s.color, s.width);
+    const pts = p.stroke.pts.map(([x, y]) => toPdf(p, x, y));
+    p.stroke = null;
+    finishHighlight(p, pts, s);
+    return;
   } else if (p.rectStart) {
-    const [x, y] = pos(p, e);
-    if (Math.abs(x - p.rectStart[0]) > 3 && Math.abs(y - p.rectStart[1]) > 3) {
-      const a = toPdf(p, p.rectStart[0], p.rectStart[1]), b = toPdf(p, x, y);
-      made = { id: newId(), subtype: 'Square', color: s.color, ca: 1, width: s.width, existing: false, deleted: false,
-        rect: [Math.min(a[0], b[0]), Math.min(a[1], b[1]), Math.max(a[0], b[0]), Math.max(a[1], b[1])] };
-    }
+    const { x0, y0, x1, y1 } = p.live;
+    const big = SHAPE_TOOLS.has(tool) && (tool === 'line' || tool === 'arrow' ? Math.hypot(x1 - x0, y1 - y0) > 4 : Math.abs(x1 - x0) > 3 && Math.abs(y1 - y0) > 3);
+    if (big) made = makeShape(tool, toPdf(p, x0, y0), toPdf(p, x1, y1), s.color, s.width);
   } else if (p.erased) {
-    if (p.erased.length) pushUndo({ type: 'del', p, list: p.erased });
-    p.erased = null;
+    if (p.eraseAdded.length) pushUndo({ type: 'edit', p, removed: p.erased, added: p.eraseAdded });
+    else if (p.erased.length) pushUndo({ type: 'del', p, list: p.erased });
+    p.erased = null; p.eraseAdded = null;
     return;
   }
   p.stroke = null; p.rectStart = null; p.live = null;
@@ -712,13 +945,36 @@ function onUp(p, e) {
   if (made && !state.lock) selectTool('view');
 }
 
+// Evidenziatore: se sotto il tratto c'è del testo, la barra si aggancia alle righe (come Acrobat/Drawboard).
+async function finishHighlight(p, pts, s) {
+  const xs = pts.map((q) => q[0]), ys = pts.map((q) => q[1]);
+  const band = [Math.min(...xs), Math.min(...ys), Math.max(...xs), Math.max(...ys)];
+  if (band[3] - band[1] < s.width * 1.5) { const cy = ys.reduce((a, b) => a + b, 0) / ys.length; band[1] = cy - s.width / 2; band[3] = cy + s.width / 2; }
+  const { items } = await textOf(p);
+  p.live = null;
+  if (!state.pages.includes(p)) return; // documento cambiato nel frattempo
+  const quads = textQuads(items, band);
+  const made = quads.length ? makeTextHighlight(quads, s.color) : makeHighlight(pts, s.color, s.width);
+  p.annots.push(made); pushUndo({ type: 'add', p, a: made });
+  draw(p);
+  if (!state.lock) selectTool('view');
+}
+
 function eraseAt(p, x, y) {
   const [px, py] = toPdf(p, x, y);
-  const tol = Math.max(3, (p.tool === 'eraser' && slotCur()?.type !== 'eraser' ? eraserSlot() : slotCur()).width) / state.scale + 2;
+  const es = p.tool === 'eraser' && slotCur()?.type !== 'eraser' ? eraserSlot() : slotCur();
+  const tol = Math.max(3, es.width) / state.scale + 2;
   let hit = false;
-  for (const a of p.annots) {
+  for (const a of [...p.annots]) {
     if (a.deleted || !hitTest(a, px, py, tol)) continue;
-    a.deleted = true; p.erased.push(a); hit = true;
+    if (es.style === 'partial' && a.subtype === 'Ink' && a.ink?.length) {
+      // gomma parziale: il tratto viene diviso, restano i pezzi fuori dalla gomma
+      const pieces = eraseInk(a, px, py, tol + a.width / 2);
+      if (!pieces) continue;
+      a.deleted = true; p.erased.push(a);
+      for (const b of pieces) { p.annots.push(b); p.eraseAdded.push(b); }
+    } else { a.deleted = true; p.erased.push(a); }
+    hit = true;
   }
   if (hit) draw(p);
 }
@@ -740,25 +996,45 @@ function segDist(px, py, ax, ay, bx, by) {
   return Math.hypot(px - (ax + t * dx), py - (ay + t * dy));
 }
 
-function openText(p, x, y) {
+// Strumento Testo su un testo esistente: lo apre per la modifica.
+function textHit(p, x, y) {
+  const [px, py] = toPdf(p, x, y);
+  return [...p.annots].reverse().find((a) => !a.deleted && a.subtype === 'FreeText' && px >= a.rect[0] && px <= a.rect[2] && py >= a.rect[1] && py <= a.rect[3]) || null;
+}
+
+function openText(p, x, y, edit = null) {
   const s = slotCur(), ta = document.createElement('textarea');
   ta.className = 'txt';
-  Object.assign(ta.style, { left: `${x}px`, top: `${y}px`, width: `${180 * state.scale}px`, height: `${(s.width * 2.6 + 4) * state.scale}px`, fontSize: `${s.width * state.scale}px` });
+  const size = edit ? edit.fontSize : s.width, color = edit ? edit.color : s.color;
+  let box = [x, y, x + 180 * state.scale, y + (size * 2.6 + 4) * state.scale];
+  if (edit) { const r = rectBox(p.vp, edit.rect); box = [r[0], r[1], r[2], Math.max(r[3], r[1] + (size * 1.4 + 4) * state.scale)]; ta.value = edit.text; }
+  Object.assign(ta.style, {
+    left: `${box[0]}px`, top: `${box[1]}px`, width: `${box[2] - box[0]}px`, height: `${box[3] - box[1]}px`,
+    fontSize: `${size * state.scale}px`, fontFamily: TEXT_FONT,
+  });
   p.el.append(ta);
   setTimeout(() => ta.focus(), 0);
   let done = false;
   const finish = (commit) => {
     if (done) return; done = true;
     const text = ta.value.trim();
-    if (commit && text) {
-      const l = ta.offsetLeft, t = ta.offsetTop, w = ta.offsetWidth, h = ta.offsetHeight;
-      const a = toPdf(p, l, t + h), b = toPdf(p, l + w, t);
-      const made = { id: newId(), subtype: 'FreeText', color: s.color, ca: 1, width: 0, text, fontSize: s.width, existing: false, deleted: false,
-        rect: [Math.min(a[0], b[0]), Math.min(a[1], b[1]), Math.max(a[0], b[0]), Math.max(a[1], b[1])] };
+    const l = ta.offsetLeft, t = ta.offsetTop, w = ta.offsetWidth, h = ta.offsetHeight;
+    ta.remove();
+    if (!commit) return;
+    const a = toPdf(p, l, t + h), b = toPdf(p, l + w, t);
+    const rect = [Math.min(a[0], b[0]), Math.min(a[1], b[1]), Math.max(a[0], b[0]), Math.max(a[1], b[1])];
+    if (edit) {
+      if (!text) { edit.deleted = true; pushUndo({ type: 'del', p, list: [edit] }); draw(p); return; }
+      if (text === edit.text && Math.abs(rect[2] - rect[0] - (edit.rect[2] - edit.rect[0])) < 1) return;
+      const made = { ...cloneAnnot(edit), text, rect };
+      edit.deleted = true; p.annots.push(made);
+      pushUndo({ type: 'edit', p, removed: [edit], added: [made] });
+      draw(p);
+    } else if (text) {
+      const made = { id: newId(), subtype: 'FreeText', color, ca: 1, width: 0, text, fontSize: size, existing: false, deleted: false, rect };
       p.annots.push(made); pushUndo({ type: 'add', p, a: made }); draw(p);
       if (!state.lock) selectTool('view');
     }
-    ta.remove();
   };
   ta.addEventListener('blur', () => finish(true));
   ta.addEventListener('keydown', (e) => {
@@ -767,7 +1043,137 @@ function openText(p, x, y) {
   });
 }
 
-/* ---------- annulla / stato ---------- */
+/* ---------- selezione a lazo: sposta, ridimensiona, ricolora, elimina ---------- */
+const selbar = $('selbar');
+const invert = (m) => {
+  const det = m[0] * m[3] - m[1] * m[2];
+  return [m[3] / det, -m[1] / det, -m[2] / det, m[0] / det, (m[2] * m[5] - m[3] * m[4]) / det, (m[1] * m[4] - m[0] * m[5]) / det];
+};
+const matOf = (M) => [M.s, 0, 0, M.s, M.tx, M.ty];
+const mapRect = (r, M) => [r[0] * M.s + M.tx, r[1] * M.s + M.ty, r[2] * M.s + M.tx, r[3] * M.s + M.ty];
+
+function clearSel() {
+  if (!state.sel) return;
+  const { p } = state.sel;
+  state.sel = null;
+  selbar.hidden = true;
+  if (state.pages.includes(p)) draw(p);
+}
+
+function setSel(p, items) {
+  state.sel = items.length ? { p, items, box: unionRect(items), M: null } : null;
+  draw(p);
+  placeSelbar();
+}
+
+function placeSelbar() {
+  const sel = state.sel;
+  if (!sel || sel.drag || !sel.p.el.isConnected) { selbar.hidden = true; return; }
+  const r = sel.p.ov.getBoundingClientRect(), [x0, y0, x1] = selBox(sel.p, sel);
+  selbar.hidden = false;
+  $('selN').textContent = sel.items.length === 1 ? '1 elemento' : `${sel.items.length} elementi`;
+  const w = selbar.offsetWidth, h = selbar.offsetHeight;
+  const top = r.top + y0 - h - 10 > 60 ? r.top + y0 - h - 10 : r.top + selBox(sel.p, sel)[3] + 10;
+  selbar.style.left = `${Math.max(8, Math.min(innerWidth - w - 8, r.left + (x0 + x1) / 2 - w / 2))}px`;
+  selbar.style.top = `${Math.max(56, Math.min(innerHeight - h - 8, top))}px`;
+}
+els.pages.addEventListener('scroll', () => { if (state.sel) placeSelbar(); }, { passive: true });
+
+$('selSw').append(...PALETTE.map((c, i) => {
+  const b = document.createElement('button');
+  b.className = 'sw'; b.title = PALETTE_NAMES[i];
+  b.addEventListener('click', () => recolorSel(c));
+  return b;
+}));
+const paintSelSwatches = () => [...$('selSw').children].forEach((b, i) => { b.style.background = rgba(PALETTE[i], 1); });
+paintSelSwatches();
+$('selDel').addEventListener('click', () => deleteSel());
+
+function deleteSel() {
+  const sel = state.sel;
+  if (!sel) return;
+  for (const a of sel.items) a.deleted = true;
+  pushUndo({ type: 'del', p: sel.p, list: sel.items });
+  clearSel();
+}
+
+function replaceSel(fn) {
+  const sel = state.sel;
+  if (!sel) return;
+  const added = sel.items.map(fn);
+  for (const a of sel.items) a.deleted = true;
+  sel.p.annots.push(...added);
+  pushUndo({ type: 'edit', p: sel.p, removed: sel.items, added });
+  setSel(sel.p, added);
+}
+const recolorSel = (c) => replaceSel((a) => recolor(a, c));
+const moveSel = (dx, dy) => replaceSel((a) => cloneAnnot(a, { s: 1, tx: dx, ty: dy }));
+
+function lassoDown(p, x, y) {
+  const sel = state.sel?.p === p ? state.sel : null;
+  if (sel) {
+    const [x0, y0, x1, y1] = selBox(p, sel), q = toPdf(p, x, y);
+    const corners = [[x0, y0, x1, y1], [x1, y0, x0, y1], [x0, y1, x1, y0], [x1, y1, x0, y0]];
+    const c = corners.find(([cx, cy]) => Math.hypot(cx - x, cy - y) <= HANDLE + 6);
+    if (c) p.lasso = { mode: 'scale', anchor: toPdf(p, c[2], c[3]), corner: toPdf(p, c[0], c[1]) };
+    else if (x >= x0 && x <= x1 && y >= y0 && y <= y1) p.lasso = { mode: 'move', start: q };
+    if (p.lasso) { sel.drag = true; selbar.hidden = true; return; }
+  }
+  clearSel();
+  p.lasso = { mode: 'draw', pts: [[x, y]] };
+  p.live = { kind: 'lasso', pts: p.lasso.pts };
+}
+
+function lassoMove(p, e, evs) {
+  const L = p.lasso;
+  if (L.mode === 'draw') { for (const ev of evs) L.pts.push(pos(p, ev)); requestDraw(p); return; }
+  const q = toPdf(p, ...pos(p, e)), sel = state.sel;
+  if (L.mode === 'move') sel.M = { s: 1, tx: q[0] - L.start[0], ty: q[1] - L.start[1] };
+  else {
+    const [ax, ay] = L.anchor, vx = L.corner[0] - ax, vy = L.corner[1] - ay;
+    const s = Math.min(20, Math.max(0.05, ((q[0] - ax) * vx + (q[1] - ay) * vy) / (vx * vx + vy * vy || 1)));
+    sel.M = { s, tx: ax * (1 - s), ty: ay * (1 - s) };
+  }
+  requestDraw(p);
+}
+
+function lassoUp(p) {
+  const L = p.lasso, sel = state.sel;
+  p.lasso = null; p.live = null; p.tool = null;
+  if (L.mode === 'draw') {
+    const poly = L.pts.map(([x, y]) => toPdf(p, x, y));
+    let items;
+    if (L.pts.length < 4 || polyArea(poly) < 4) {
+      // semplice tocco: seleziona l'annotazione sotto il puntatore
+      const [px, py] = poly[0], hit = [...p.annots].reverse().find((a) => !a.deleted && hitTest(a, px, py, 4 / state.scale + 2));
+      items = hit ? [hit] : [];
+    } else {
+      items = p.annots.filter((a) => !a.deleted && (a.subtype === 'Ink' && a.ink?.length
+        ? a.ink.some((s) => { for (let i = 0; i + 1 < s.length; i += 2) if (inPoly(s[i], s[i + 1], poly)) return true; return false; })
+        : inPoly((a.rect[0] + a.rect[2]) / 2, (a.rect[1] + a.rect[3]) / 2, poly)));
+    }
+    setSel(p, items);
+    if (!items.length) draw(p);
+    return;
+  }
+  sel.drag = false;
+  const M = sel.M;
+  sel.M = null;
+  if (M && (Math.abs(M.tx) + Math.abs(M.ty) > 0.3 || Math.abs(M.s - 1) > 0.005)) replaceSel((a) => cloneAnnot(a, M));
+  else { draw(p); placeSelbar(); }
+}
+
+const polyArea = (poly) => Math.abs(poly.reduce((s, [x, y], i) => { const [x2, y2] = poly[(i + 1) % poly.length]; return s + x * y2 - x2 * y; }, 0) / 2);
+function inPoly(x, y, poly) {
+  let inside = false;
+  for (let i = 0, j = poly.length - 1; i < poly.length; j = i++) {
+    const [xi, yi] = poly[i], [xj, yj] = poly[j];
+    if ((yi > y) !== (yj > y) && x < ((xj - xi) * (y - yi)) / (yj - yi) + xi) inside = !inside;
+  }
+  return inside;
+}
+
+/* ---------- annulla / ripeti / stato ---------- */
 function setDirty(v) {
   state.dirty = v;
   els.save.disabled = !v || state.encrypted;
@@ -777,46 +1183,70 @@ let draftTimer = 0;
 // Bozza = modifiche non salvate (annotazioni nuove/eliminate e, se cambiata la struttura, il PDF modificato).
 function flushDraftOf(rec) {
   const pages = serializeDraft(rec.pages);
-  const key = draftKey(rec.name, rec.origSize);
-  if (Object.keys(pages).length || rec.edited) return kvSet(key, { name: rec.name, origSize: rec.origSize, bytes: rec.edited || undefined, pages });
-  return kvDel(key);
+  if (Object.keys(pages).length || rec.edited) return kvSet(rec.dkey, { name: rec.name, origSize: rec.origSize, bytes: rec.edited || undefined, pages });
+  return kvDel(rec.dkey);
 }
 function flushDraft() { if (active && state.doc) { saveActive(); flushDraftOf(active); } }
 async function flushAllDrafts() {
   clearTimeout(draftTimer);
   saveActive();
   await Promise.all(docs.map(flushDraftOf));
-}function scheduleDraft() {
+}
+function scheduleDraft() {
   clearTimeout(draftTimer);
   draftTimer = setTimeout(flushDraft, 1200);
 }
-function pushUndo(op) { state.undo.push(op); els.undo.disabled = false; setDirty(true); scheduleDraft(); }
-function undo() {
-  const op = state.undo.pop();
-  if (!op || op.type === 'draft') { els.undo.disabled = !state.undo.length; return; }
-  scheduleDraft();
-  if (op.type === 'add') { const i = op.p.annots.indexOf(op.a); if (i >= 0) op.p.annots.splice(i, 1); }
-  else for (const a of op.list) a.deleted = false;
-  draw(op.p);
-  els.undo.disabled = !state.undo.length;
-  setDirty(state.undo.length > 0 || state.dirty);
+function pushUndo(op) {
+  state.undo.push(op); state.redo.length = 0;
+  updateHistoryButtons(); setDirty(true); scheduleDraft();
+  if (sidePanel === 'markups') buildMarkups();
 }
+const removeAnnot = (p, a) => { const i = p.annots.indexOf(a); if (i >= 0) p.annots.splice(i, 1); };
+// dir = -1 annulla, +1 ripeti
+function applyOp(op, dir) {
+  if (op.type === 'add') { if (dir < 0) removeAnnot(op.p, op.a); else { op.a.deleted = false; op.p.annots.push(op.a); } }
+  else if (op.type === 'del') for (const a of op.list) a.deleted = dir > 0;
+  else if (op.type === 'edit') {
+    for (const a of op.removed) a.deleted = dir > 0;
+    for (const a of op.added) if (dir < 0) removeAnnot(op.p, a); else if (!op.p.annots.includes(a)) op.p.annots.push(a);
+  }
+  draw(op.p);
+}
+async function history(dir) {
+  const from = dir < 0 ? state.undo : state.redo, to = dir < 0 ? state.redo : state.undo;
+  const op = from[from.length - 1];
+  if (!op || op.type === 'draft' || busyOp) return;
+  clearSel();
+  if (op.type === 'page') { await restorePages(op, dir); return; }
+  from.pop(); to.push(op);
+  applyOp(op, dir);
+  scheduleDraft();
+  updateHistoryButtons();
+  setDirty(state.undo.length > 0 || state.dirty);
+  if (sidePanel === 'markups') buildMarkups();
+}
+const undo = () => history(-1);
+const redo = () => history(1);
 
 /* ---------- strumenti a destra: preferiti + strumenti personalizzati ---------- */
 const TYPES = {
   pen: 'Penna', marker: 'Evidenziatore a mano libera', highlighter: 'Evidenziatore testo', eraser: 'Gomma',
-  laser: 'Puntatore laser', text: 'Testo', rect: 'Rettangolo',
+  laser: 'Puntatore laser', text: 'Testo', rect: 'Rettangolo', ellipse: 'Ellisse', line: 'Linea', arrow: 'Freccia',
 };
 const TYPE_DEFAULTS = {
   pen: { style: 'pressure', color: [0, 0, 0], width: 2, opacity: 1, smooth: true, straighten: false },
   marker: { style: 'marker', color: [1, 0.87, 0.38], width: 14, opacity: 0.35, smooth: true, straighten: false },
   highlighter: { color: [1, 0.87, 0.38], width: 11 },
-  eraser: { color: [0.6, 0.6, 0.6], width: 6 },
+  eraser: { style: 'stroke', color: [0.6, 0.6, 0.6], width: 6 },
   laser: { color: [0.95, 0.1, 0.1], width: 3 },
   text: { color: [0, 0, 0], width: 12 },
   rect: { color: [0.9, 0.15, 0.15], width: 1.5 },
+  ellipse: { color: [0.9, 0.15, 0.15], width: 1.5 },
+  line: { color: [0.15, 0.45, 0.9], width: 1.5 },
+  arrow: { color: [0.9, 0.15, 0.15], width: 1.5 },
 };
-const toolName = (s) => s.name || (s.type === 'pen' ? STYLES[s.style] || TYPES.pen : TYPES[s.type]);
+const toolName = (s) => s.name || (s.type === 'pen' ? STYLES[s.style] || TYPES.pen : s.type === 'eraser' && s.style === 'partial' ? 'Gomma parziale' : TYPES[s.type]);
+const slotTool = () => state.tool !== 'view' && state.tool !== 'lasso'; // è attivo uno strumento dei preferiti
 const toHex = (c) => `#${c.map((v) => Math.round(v * 255).toString(16).padStart(2, '0')).join('')}`;
 const fromHex = (h) => [1, 3, 5].map((i) => parseInt(h.slice(i, i + 2), 16) / 255);
 
@@ -827,7 +1257,7 @@ const toolColor = (s) => (s.type === 'eraser' ? '#e7b3b3' : rgba(s.color, 1));
 // Icona colorata + pallino che mostra lo spessore: si distinguono a colpo d'occhio due penne dello stesso colore.
 function glyph(s) {
   const col = toolColor(s);
-  const showW = INK_TOOLS.has(s.type) || s.type === 'highlighter' || s.type === 'rect';
+  const showW = INK_TOOLS.has(s.type) || s.type === 'highlighter' || SHAPE_TOOLS.has(s.type);
   const w = Math.max(3, Math.min(14, Math.round(2 + Math.sqrt(s.width) * 2.2)));
   return ic(toolIcon(s), { color: col }) + (showW ? `<span class="wdot" style="width:${w}px;height:3px;color:${col}"></span>` : '');
 }
@@ -835,14 +1265,14 @@ function renderFav() {
   els.slots.replaceChildren();
   state.slots.forEach((s, i) => {
     const b = document.createElement('button');
-    const on = i === state.slot && state.tool !== 'view';
+    const on = i === state.slot && slotTool();
     b.className = `slot${on ? ' on' : ''}`;
     b.title = on ? `${toolName(s)} — clic per modificare` : toolName(s);
     b.setAttribute('aria-pressed', String(on));
     b.innerHTML = glyph(s);
     b.draggable = true;
     b.addEventListener('click', () => {
-      if (state.slot === i && state.tool !== 'view') { els.pop.hidden = !els.pop.hidden; fillPop(); } else { state.slot = i; selectTool(s.type); }
+      if (state.slot === i && slotTool()) { els.pop.hidden = !els.pop.hidden; fillPop(); } else { state.slot = i; selectTool(s.type); }
     });
     b.addEventListener('dragstart', (e) => e.dataTransfer.setData('text/plain', String(i)));
     b.addEventListener('dragover', (e) => e.preventDefault());
@@ -860,16 +1290,23 @@ function renderFav() {
   });
   $('view').classList.toggle('on', state.tool === 'view');
   $('view').setAttribute('aria-pressed', String(state.tool === 'view'));
+  $('lasso').classList.toggle('on', state.tool === 'lasso');
+  $('lasso').setAttribute('aria-pressed', String(state.tool === 'lasso'));
   $('lock').classList.toggle('on', state.lock);
   $('lock').setAttribute('aria-pressed', String(state.lock));
   $('lock').innerHTML = ic(state.lock ? 'lock' : 'unlock');
 }
 
 function selectTool(t) {
+  const was = state.tool;
   state.tool = t;
-  if (t === 'view') els.pop.hidden = true;
+  if (t === 'view' || t === 'lasso') els.pop.hidden = true;
+  if (t !== 'lasso') clearSel();
   document.body.dataset.tool = t;
   document.body.dataset.finger = state.finger && t !== 'view' ? '1' : '0';
+  if (t !== was) document.getSelection()?.removeAllRanges();
+  // il livello di testo si costruisce solo in modalità Sfoglia, per le pagine già visibili
+  if (t === 'view') for (const p of state.pages) if (p.key) buildTextLayer(p);
   renderFav();
 }
 
@@ -909,12 +1346,13 @@ function fillPop() {
   els.popW.max = s.type === 'text' ? 48 : s.type === 'marker' || s.type === 'highlighter' ? 40 : 20;
   $('popWT').textContent = s.type === 'text' ? 'Corpo' : s.type === 'eraser' ? 'Raggio' : 'Spessore';
   showPopValues();
-  $('popStyleL').hidden = s.type !== 'pen';
+  $('popStyleL').hidden = s.type !== 'pen' && s.type !== 'eraser';
   $('popOpL').hidden = !ink;
   $('popSmL').hidden = !ink;
   $('popStL').hidden = s.type !== 'pen';
-  if (s.type === 'pen') {
-    $('popStyle').replaceChildren(...Object.entries(STYLES).map(([k, v]) => new Option(v, k, false, k === s.style)));
+  if (s.type === 'pen' || s.type === 'eraser') {
+    const list = s.type === 'pen' ? STYLES : ERASER_STYLES;
+    $('popStyle').replaceChildren(...Object.entries(list).map(([k, v]) => new Option(v, k, false, k === (s.style || 'stroke'))));
   }
   $('popOp').value = s.opacity ?? 1;
   $('popSm').checked = s.smooth !== false;
@@ -964,8 +1402,10 @@ $('resetTools').addEventListener('click', async () => {
 });
 
 $('view').addEventListener('click', () => selectTool('view'));
+$('lasso').addEventListener('click', () => selectTool(state.tool === 'lasso' ? 'view' : 'lasso'));
 $('lock').addEventListener('click', () => { state.lock = !state.lock; persistPrefs(); renderFav(); });
 els.undo.addEventListener('click', undo);
+els.redo.addEventListener('click', redo);
 
 /* ---------- barra superiore ---------- */
 // Pagina corrente = quella che occupa il terzo superiore dell'area visibile (calcolata dalla posizione reale di scorrimento).
@@ -1016,7 +1456,8 @@ function applyFit(mode) {
   if (!state.pages.length) return;
   const i = currentPage(), b = state.pages[i].proxy.getViewport({ scale: 1 });
   const cs = getComputedStyle(els.pages);
-  const w = els.pages.clientWidth - parseFloat(cs.paddingLeft) - parseFloat(cs.paddingRight);
+  let w = els.pages.clientWidth - parseFloat(cs.paddingLeft) - parseFloat(cs.paddingRight);
+  if (state.spread && state.pages.length > 1) w = (w - parseFloat(cs.columnGap || '12')) / 2; // due pagine per riga
   const h = els.pages.clientHeight - 24;
   const sc = mode === 'page' ? Math.min(w / b.width, h / b.height) : w / b.width;
   state.scale = Math.min(6, Math.max(0.2, sc));
@@ -1037,7 +1478,135 @@ const refit = () => { if (!state.fitMode || fitRaf) return; fitRaf = requestAnim
 window.addEventListener('resize', refit);els.pages.addEventListener('wheel', (e) => { if (e.ctrlKey) { e.preventDefault(); zoom(e.deltaY < 0 ? 1.1 : 1 / 1.1); } }, { passive: false });
 
 function invalidateAll() { layout(); }
-$('dark').addEventListener('click', (e) => { state.dark = !state.dark; setSwitch(e.currentTarget, state.dark); persistPrefs(); invalidateAll(); renderFav(); });
+$('dark').addEventListener('click', (e) => { state.dark = !state.dark; setSwitch(e.currentTarget, state.dark); persistPrefs(); invalidateAll(); renderFav(); paintSelSwatches(); });
+$('realImg').addEventListener('click', (e) => { state.realImg = !state.realImg; setSwitch(e.currentTarget, state.realImg); persistPrefs(); invalidateAll(); });
+const markSpread = () => { $('spread').classList.toggle('on', state.spread); $('spread').setAttribute('aria-pressed', String(state.spread)); };
+markSpread();
+$('spread').addEventListener('click', () => {
+  state.spread = !state.spread; markSpread(); persistPrefs();
+  const i = currentPage();
+  if (state.fitMode) applyFit(state.fitMode); else { layout(); goPage(i + 1); }
+});
+
+/* ---------- zoom con due dita (pizzico) ---------- */
+// Durante il gesto le pagine scalano il bitmap già disegnato (nessun rendering); al rilascio si ridisegna una volta.
+const touches = new Map();
+let pinch = null;
+const touchPair = () => {
+  const [a, b] = [...touches.values()];
+  return [Math.hypot(a[0] - b[0], a[1] - b[1]), (a[0] + b[0]) / 2, (a[1] + b[1]) / 2];
+};
+els.pages.addEventListener('pointerdown', (e) => {
+  if (e.pointerType !== 'touch') return;
+  touches.set(e.pointerId, [e.clientX, e.clientY]);
+  if (touches.size !== 2 || !state.pages.length) return;
+  // il secondo dito annulla il tratto o lo spostamento iniziato dal primo
+  for (const p of state.pages) {
+    p.pan = null;
+    if (p.stroke || p.rectStart || p.lasso || p.erased) { p.stroke = p.rectStart = p.lasso = p.erased = p.live = null; draw(p); }
+  }
+  const [d, cx, cy] = touchPair();
+  pinch = { d0: d, s0: state.scale, cx, cy, raf: 0 };
+  state.fitMode = null; markFit();
+}, true);
+els.pages.addEventListener('pointermove', (e) => {
+  if (!touches.has(e.pointerId)) return;
+  touches.set(e.pointerId, [e.clientX, e.clientY]);
+  if (!pinch) return;
+  e.stopPropagation();
+  if (!pinch.raf) pinch.raf = requestAnimationFrame(pinchStep);
+}, true);
+const endTouch = (e) => {
+  if (!touches.delete(e.pointerId) || !pinch || touches.size >= 2) return;
+  cancelAnimationFrame(pinch.raf);
+  pinch = null;
+  layout(); // rendering alla nuova scala
+};
+els.pages.addEventListener('pointerup', endTouch, true);
+els.pages.addEventListener('pointercancel', endTouch, true);
+function pinchStep() {
+  pinch.raf = 0;
+  if (touches.size < 2) return;
+  const [d, cx, cy] = touchPair();
+  const next = Math.min(6, Math.max(0.25, (pinch.s0 * d) / pinch.d0)), k = next / state.scale;
+  const r = els.pages.getBoundingClientRect();
+  // il punto del documento sotto le dita resta sotto le dita (anche se le dita si spostano)
+  const ax = els.pages.scrollLeft + pinch.cx - r.left, ay = els.pages.scrollTop + pinch.cy - r.top;
+  pinch.cx = cx; pinch.cy = cy;
+  if (Math.abs(k - 1) > 0.002) { state.scale = next; layout(); }
+  els.pages.scrollLeft = ax * k - (cx - r.left);
+  els.pages.scrollTop = ay * k - (cy - r.top);
+}
+
+/* ---------- righello ---------- */
+// Si sposta trascinandolo, ruota con la rotellina (Maiusc: a scatti di 15°) o con due dita; doppio clic = orizzontale.
+// Una penna che inizia vicino a un bordo traccia una linea dritta lungo quel bordo.
+const rulerEl = $('ruler');
+const ruler = { on: false, x: 0, y: 0, ang: 0 };
+const pxPerMm = () => (state.scale * 72) / 25.4;
+function placeRuler() {
+  rulerEl.style.transform = `translate(${ruler.x - rulerEl.offsetWidth / 2}px, ${ruler.y - rulerEl.offsetHeight / 2}px) rotate(${ruler.ang}deg)`;
+  rulerEl.style.setProperty('--mm', `${pxPerMm()}px`);
+  $('rulerDeg').textContent = `${Math.round(((ruler.ang % 360) + 360) % 360)}°`;
+}
+$('rulerBtn').addEventListener('click', () => {
+  ruler.on = !ruler.on;
+  rulerEl.hidden = !ruler.on;
+  $('rulerBtn').classList.toggle('on', ruler.on);
+  $('rulerBtn').setAttribute('aria-pressed', String(ruler.on));
+  if (ruler.on && !ruler.x) { const r = els.pages.getBoundingClientRect(); ruler.x = r.left + r.width / 2; ruler.y = r.top + r.height / 2; }
+  if (ruler.on) placeRuler();
+});
+const rulerPtr = new Map();
+let rulerGesture = null;
+rulerEl.addEventListener('pointerdown', (e) => {
+  e.preventDefault();
+  rulerEl.setPointerCapture(e.pointerId);
+  rulerPtr.set(e.pointerId, [e.clientX, e.clientY]);
+  const pts = [...rulerPtr.values()];
+  rulerGesture = { x: ruler.x, y: ruler.y, ang: ruler.ang, start: pts.map((p) => [...p]) };
+});
+rulerEl.addEventListener('pointermove', (e) => {
+  if (!rulerPtr.has(e.pointerId) || !rulerGesture) return;
+  rulerPtr.set(e.pointerId, [e.clientX, e.clientY]);
+  const pts = [...rulerPtr.values()], g = rulerGesture;
+  if (pts.length === 1 && g.start.length === 1) { ruler.x = g.x + pts[0][0] - g.start[0][0]; ruler.y = g.y + pts[0][1] - g.start[0][1]; }
+  else if (pts.length >= 2 && g.start.length >= 2) {
+    const a0 = Math.atan2(g.start[1][1] - g.start[0][1], g.start[1][0] - g.start[0][0]), a1 = Math.atan2(pts[1][1] - pts[0][1], pts[1][0] - pts[0][0]);
+    ruler.ang = g.ang + ((a1 - a0) * 180) / Math.PI;
+    ruler.x = g.x + (pts[0][0] + pts[1][0] - g.start[0][0] - g.start[1][0]) / 2;
+    ruler.y = g.y + (pts[0][1] + pts[1][1] - g.start[0][1] - g.start[1][1]) / 2;
+  }
+  placeRuler();
+});
+const rulerUp = (e) => {
+  rulerPtr.delete(e.pointerId);
+  const pts = [...rulerPtr.values()];
+  rulerGesture = pts.length ? { x: ruler.x, y: ruler.y, ang: ruler.ang, start: pts.map((p) => [...p]) } : null;
+};
+rulerEl.addEventListener('pointerup', rulerUp);
+rulerEl.addEventListener('pointercancel', rulerUp);
+rulerEl.addEventListener('wheel', (e) => { e.preventDefault(); ruler.ang += (e.deltaY < 0 ? -1 : 1) * (e.shiftKey ? 15 : 1); placeRuler(); }, { passive: false });
+rulerEl.addEventListener('dblclick', () => { ruler.ang = 0; placeRuler(); });
+
+// Se il punto (coordinate della pagina) è vicino a un bordo del righello restituisce la proiezione su quel bordo.
+function rulerSnap(p, x, y) {
+  if (!ruler.on) return null;
+  const r = p.ov.getBoundingClientRect(), cx = x + r.left, cy = y + r.top;
+  const a = (ruler.ang * Math.PI) / 180, ux = Math.cos(a), uy = Math.sin(a), nx = -uy, ny = ux;
+  const hw = rulerEl.offsetWidth / 2, hh = rulerEl.offsetHeight / 2;
+  if (Math.abs((cx - ruler.x) * ux + (cy - ruler.y) * uy) > hw + 24) return null;
+  for (const side of [-1, 1]) {
+    const ex = ruler.x + nx * hh * side, ey = ruler.y + ny * hh * side;
+    if (Math.abs((cx - ex) * nx + (cy - ey) * ny) < 28) {
+      return (px, py) => {
+        const t = (px + r.left - ex) * ux + (py + r.top - ey) * uy;
+        return [ex + ux * t - r.left, ey + uy * t - r.top];
+      };
+    }
+  }
+  return null;
+}
 function setEco(on) { state.eco = on; setSwitch($('eco'), on); invalidateAll(); }
 $('eco').addEventListener('click', () => { state.userEco = true; setEco(!state.eco); persistPrefs(); });
 $('grid').addEventListener('change', (e) => { state.grid = e.target.value; persistPrefs(); state.pages.forEach(drawGrid); });
@@ -1092,59 +1661,202 @@ window.addEventListener('drop', async (e) => {
 });
 window.launchQueue?.setConsumer(async (lp) => { if (lp.files?.[0]) await openFromHandle(lp.files[0]); });
 
-async function save() {
-  if (!state.lib || state.encrypted) return;
+// Copia del documento con le modifiche applicate, senza toccare quello aperto (esportazioni, "Salva con nome").
+async function bakedLib() {
+  const lib = await PDFDocument.load(active.src, { ignoreEncryption: true, updateMetadata: false, parseSpeed: ParseSpeeds.Fastest });
+  for (const p of state.pages) await applyChanges(lib, lib.getPage(p.index), p.annots);
+  return lib;
+}
+const SAVE_OPTS = { useObjectStreams: false, objectsPerTick: 2000 };
+const stem = () => state.name.replace(/\.pdf$/i, '');
+
+function download(name, bytes, type) {
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(new Blob([bytes], { type }));
+  a.download = name; a.click();
+  setTimeout(() => URL.revokeObjectURL(a.href), 4000);
+}
+
+// Esporta un file nuovo (non diventa il documento aperto). Restituisce il nome scelto, o null se annullato.
+async function exportFile(name, bytes, ext) {
+  const type = ext === 'png' ? 'image/png' : 'application/pdf';
+  if (window.native) { const p = await window.native.exportFile(name, bytes, ext); return p && baseName(p); }
+  if (window.showSaveFilePicker) {
+    try {
+      const h = await window.showSaveFilePicker({ suggestedName: name, types: [{ description: ext.toUpperCase(), accept: { [type]: [`.${ext}`] } }] });
+      const w = await h.createWritable(); await w.write(bytes); await w.close();
+      return h.name;
+    } catch (e) { if (e.name === 'AbortError') return null; throw e; }
+  }
+  download(name, bytes, type);
+  return name;
+}
+
+async function save({ as = false } = {}) {
+  if (!state.lib || state.encrypted || busyOp) return;
+  // "Salva con nome" (o file senza percorso noto): il documento aperto non viene modificato finché il file non è scritto
+  const ask = as || (window.native ? !state.path : !state.handle && !!window.showSaveFilePicker);
   setStatus('Salvataggio…');
   try {
-    for (const p of state.pages) await applyChanges(state.lib, state.lib.getPage(p.index), p.annots);
-    const bytes = await state.lib.save({ useObjectStreams: false, objectsPerTick: 2000 });
-    if (window.native) {
-      if (state.path) await window.native.write(state.path, bytes);
-      else {
-        const p = await window.native.saveAs(state.name, bytes); // file trascinato: percorso ignoto → "Salva con nome"
-        if (!p) { setStatus(''); return; }
-        state.path = p; state.name = baseName(p);
-      }
-    } else if (state.handle) {
+    let bytes;
+    if (ask) bytes = await (await bakedLib()).save(SAVE_OPTS);
+    else {
+      for (const p of state.pages) await applyChanges(state.lib, state.lib.getPage(p.index), p.annots);
+      bytes = await state.lib.save(SAVE_OPTS);
+    }
+    const oldKey = active.dkey;
+    if (ask && window.native) {
+      const p = await window.native.saveAs(state.name, bytes);
+      if (!p) { setStatus(''); return; }
+      state.path = p; state.name = baseName(p); state.handle = null;
+    } else if (ask) {
+      let h;
+      try {
+        h = await window.showSaveFilePicker({ suggestedName: state.name, types: [{ description: 'PDF', accept: { 'application/pdf': ['.pdf'] } }] });
+      } catch { setStatus(''); return; }
+      const w = await h.createWritable(); await w.write(bytes); await w.close();
+      state.handle = h; state.name = h.name; state.path = null;
+    } else if (window.native) await window.native.write(state.path, bytes);
+    else if (state.handle) {
       const w = await state.handle.createWritable();
       await w.write(bytes); await w.close();
-    } else {
-      const a = document.createElement('a');
-      a.href = URL.createObjectURL(new Blob([bytes], { type: 'application/pdf' }));
-      a.download = state.name; a.click();
-      setTimeout(() => URL.revokeObjectURL(a.href), 4000);
-    }
+    } else download(state.name, bytes, 'application/pdf');
     clearTimeout(draftTimer);
-    await kvDel(draftKey(state.name, active.origSize));
+    await kvDel(oldKey);
     await loadBytes(bytes, { replace: true, noDraft: true, name: state.name, path: state.path, handle: state.handle }); // ricarica: verifica anche che il file prodotto sia leggibile
+    if (ask) addRecent(active);
     toast(`Salvato: ${state.name}`, { type: 'ok', ms: 2200 });
   } catch (e) {
     console.error(e); setStatus('');
     toast(`Salvataggio non riuscito: ${e.message}`, { type: 'error', ms: 9000 });
   }
 }
-els.save.addEventListener('click', save);
+els.save.addEventListener('click', () => save());
+
+// Pagina con i colori della carta (fondo bianco, annotazioni nei colori originali): stampa ed esportazione.
+async function paperCanvas(p, scale) {
+  const vp = p.proxy.getViewport({ scale });
+  const c = document.createElement('canvas');
+  c.width = Math.floor(vp.width); c.height = Math.floor(vp.height);
+  const ctx = c.getContext('2d', { alpha: false });
+  ctx.fillStyle = '#fff'; ctx.fillRect(0, 0, c.width, c.height);
+  await p.proxy.render({ canvasContext: ctx, canvas: c, viewport: vp, annotationMode: RENDER_MODE }).promise;
+  paperColors = true;
+  try { for (const a of p.annots) if (!a.deleted) drawAnnot(ctx, vp, a); } finally { paperColors = false; }
+  return c;
+}
+const canvasBlob = (c, type, q) => new Promise((res) => c.toBlob(res, type, q));
+
+async function printDoc() {
+  if (!state.doc || busyOp) return;
+  if (state.pages.length > 150 && !(await confirmDialog({
+    title: 'Stampare tutto il documento?', message: `Il documento ha ${state.pages.length} pagine: la preparazione può richiedere un po' di tempo e memoria.`, ok: 'Stampa',
+  }))) return;
+  const area = $('printArea'), urls = [];
+  busyOp = true;
+  try {
+    for (const p of state.pages) {
+      setStatus(`Preparazione della stampa ${p.index + 1}/${state.pages.length}…`);
+      const c = await paperCanvas(p, 150 / 72); // 150 dpi
+      const url = URL.createObjectURL(await canvasBlob(c, 'image/jpeg', 0.92));
+      c.width = c.height = 0;
+      urls.push(url);
+      const img = new Image(); img.src = url; img.alt = '';
+      await img.decode().catch(() => {});
+      area.append(img);
+    }
+  } catch (e) {
+    toast(`Stampa non riuscita: ${e.message}`, { type: 'error', ms: 8000 });
+    area.replaceChildren(); urls.forEach((u) => URL.revokeObjectURL(u));
+    return;
+  } finally { busyOp = false; setStatus(''); }
+  const cleanup = () => { area.replaceChildren(); urls.forEach((u) => URL.revokeObjectURL(u)); };
+  window.addEventListener('afterprint', cleanup, { once: true });
+  window.print();
+}
+
+async function exportPng() {
+  const p = state.pages[currentPage()];
+  if (!p) return;
+  setStatus('Esportazione…');
+  try {
+    const c = await paperCanvas(p, 200 / 72); // 200 dpi
+    const bytes = new Uint8Array(await (await canvasBlob(c, 'image/png')).arrayBuffer());
+    c.width = c.height = 0;
+    setStatus('');
+    const n = await exportFile(`${stem()} - pagina ${p.index + 1}.png`, bytes, 'png');
+    if (n) toast(`Esportata: ${n}`, { type: 'ok', ms: 2500 });
+  } catch (e) { setStatus(''); toast(`Esportazione non riuscita: ${e.message}`, { type: 'error', ms: 8000 }); }
+}
+
+async function exportFlat() {
+  if (!state.lib || state.encrypted) return;
+  setStatus('Esportazione…');
+  try {
+    const lib = await bakedLib();
+    flattenAnnots(lib);
+    const bytes = await lib.save(SAVE_OPTS);
+    setStatus('');
+    const n = await exportFile(`${stem()} (appiattito).pdf`, bytes, 'pdf');
+    if (n) toast(`Esportata: ${n}`, { type: 'ok', ms: 2500 });
+  } catch (e) { setStatus(''); toast(`Esportazione non riuscita: ${e.message}`, { type: 'error', ms: 8000 }); }
+}
+
+/* ---------- menu "Altre azioni" ---------- */
+const menu = $('menu'), menuBtn = $('menuBtn');
+const setMenu = (open) => { menu.hidden = !open; menuBtn.setAttribute('aria-expanded', String(open)); if (open) menu.querySelector('button')?.focus(); };
+menuBtn.addEventListener('click', () => setMenu(menu.hidden));
+document.addEventListener('pointerdown', (e) => { if (!menu.hidden && !e.target.closest('#menuWrap')) setMenu(false); });
+menu.addEventListener('keydown', (e) => {
+  const items = [...menu.querySelectorAll('button')], i = items.indexOf(document.activeElement);
+  if (e.key === 'Escape') { setMenu(false); menuBtn.focus(); } else if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+    e.preventDefault(); items[(i + (e.key === 'ArrowDown' ? 1 : -1) + items.length) % items.length].focus();
+  }
+});
+const ACTIONS = { saveAs: () => save({ as: true }), print: printDoc, png: exportPng, flatten: exportFlat };
+menu.addEventListener('click', (e) => { const b = e.target.closest('button[data-act]'); if (b) { setMenu(false); ACTIONS[b.dataset.act](); } });
 
 window.addEventListener('keydown', (e) => {
+  const mod = e.ctrlKey || e.metaKey;
+  if (e.key === 'F3') { e.preventDefault(); searchStep(e.shiftKey ? -1 : 1); return; }
   if (e.target.closest?.('textarea,input,select,dialog')) return;
   const k = e.key.toLowerCase();
-  if ((e.ctrlKey || e.metaKey) && k === 's') { e.preventDefault(); save(); }
-  else if ((e.ctrlKey || e.metaKey) && (k === '+' || k === '=')) { e.preventDefault(); if (state.pages.length) zoom(1.2); }
-  else if ((e.ctrlKey || e.metaKey) && k === '-') { e.preventDefault(); if (state.pages.length) zoom(1 / 1.2); }
-  else if ((e.ctrlKey || e.metaKey) && k === '0') { e.preventDefault(); zoomReset(); }
-  else if ((e.ctrlKey || e.metaKey) && k === 'o') { e.preventDefault(); openDialog(); }
-  else if ((e.ctrlKey || e.metaKey) && k === 'z') { e.preventDefault(); undo(); }
-  else if ((e.ctrlKey || e.metaKey) && k === 'w') { e.preventDefault(); if (active) closeDoc(active); }
-  else if ((e.ctrlKey || e.metaKey) && k === 't') { e.preventDefault(); openDialog(); }
-  else if ((e.ctrlKey || e.metaKey) && k === 'n' && window.native) { e.preventDefault(); window.native.newWindow(); }
+  if (mod && k === 's') { e.preventDefault(); save({ as: e.shiftKey }); }
+  else if (mod && (k === '+' || k === '=')) { e.preventDefault(); if (state.pages.length) zoom(1.2); }
+  else if (mod && k === '-') { e.preventDefault(); if (state.pages.length) zoom(1 / 1.2); }
+  else if (mod && k === '0') { e.preventDefault(); zoomReset(); }
+  else if (mod && k === 'o') { e.preventDefault(); openDialog(); }
+  else if (mod && (k === 'y' || (k === 'z' && e.shiftKey))) { e.preventDefault(); redo(); }
+  else if (mod && k === 'z') { e.preventDefault(); undo(); }
+  else if (mod && k === 'p') { e.preventDefault(); printDoc(); }
+  else if (mod && k === 'w') { e.preventDefault(); if (active) closeDoc(active); }
+  else if (mod && k === 't') { e.preventDefault(); openDialog(); }
+  else if (mod && k === 'n' && window.native) { e.preventDefault(); window.native.newWindow(); }
   else if (e.ctrlKey && k === 'tab') { e.preventDefault(); switchTab(e.shiftKey ? -1 : 1); }
-  else if ((e.ctrlKey || e.metaKey) && k === 'f') { e.preventDefault(); if (sidePanel !== 'search') openPanel('search'); $('q').focus(); }
-  else if (!e.ctrlKey && !e.metaKey && !e.altKey && state.pages.length && ['arrowright', 'pagedown', 'arrowleft', 'pageup', 'home', 'end'].includes(k)) {
+  else if (mod && k === 'f') { e.preventDefault(); if (sidePanel !== 'search') openPanel('search'); $('q').focus(); }
+  else if (mod || e.altKey) { /* altre combinazioni: al sistema */ }
+  else if (state.sel && (k === 'delete' || k === 'backspace')) { e.preventDefault(); deleteSel(); }
+  else if (state.sel && k.startsWith('arrow')) {
+    // sposta la selezione di 1 pt (Maiusc: 10 pt) nella direzione vista sullo schermo
+    e.preventDefault();
+    const d = e.shiftKey ? 10 : 1, p = state.sel.p, o = toPdf(p, 0, 0);
+    const v = { arrowleft: [-d, 0], arrowright: [d, 0], arrowup: [0, -d], arrowdown: [0, d] }[k].map((x) => x * state.scale);
+    const t = toPdf(p, v[0], v[1]);
+    moveSel(t[0] - o[0], t[1] - o[1]);
+  }
+  else if (state.pages.length && ['arrowright', 'pagedown', 'arrowleft', 'pageup', 'home', 'end'].includes(k)) {
     e.preventDefault();
     if (k === 'arrowright' || k === 'pagedown') step(1); else if (k === 'arrowleft' || k === 'pageup') step(-1);
     else if (k === 'home') goPage(1); else goPage(state.pages.length);
   }
-  else if (k === 'escape') selectTool('view');
+  else if (state.pages.length && /^[1-9]$/.test(k) && state.slots[+k - 1]) { state.slot = +k - 1; selectTool(state.slots[state.slot].type); }
+  else if (state.pages.length && k === 'l') selectTool('lasso');
+  else if (k === 'escape') {
+    if (!menu.hidden) setMenu(false);
+    else if (state.sel) clearSel();
+    else if (thumbSel.size) { thumbSel.clear(); markThumbSel(); }
+    else selectTool('view');
+  }
 });
 els.newTab.addEventListener('click', openDialog);
 
@@ -1173,66 +1885,160 @@ function openPanel(name) {
 }
 for (const b of rail.querySelectorAll('button')) b.addEventListener('click', () => openPanel(b.dataset.panel));
 
-// Indice (segnalibri del PDF)
-async function buildOutline() {
-  const list = $('outlineList');
-  list.replaceChildren();
-  const outline = await state.doc?.getOutline().catch(() => null);
-  if (!outline?.length) { list.innerHTML = '<div class="empty">Questo PDF non ha un indice.</div>'; return; }
-  const walk = (items, depth) => {
-    for (const it of items) {
-      const b = document.createElement('button');
-      b.className = 'item'; b.style.paddingLeft = `${9 + depth * 14}px`;
-      b.innerHTML = `${ic('bookmark')}<span>${esc(it.title || '(senza titolo)')}</span>`;
-      b.addEventListener('click', async () => {
-        try {
-          let dest = it.dest;
-          if (typeof dest === 'string') dest = await state.doc.getDestination(dest);
-          if (Array.isArray(dest)) goPage((await state.doc.getPageIndex(dest[0])) + 1);
-        } catch { /* destinazione non valida */ }
-      });
-      list.append(b);
-      if (it.items?.length) walk(it.items, depth + 1);
-    }
-  };
-  walk(outline, 0);
+// Indice (segnalibri del PDF): si può navigare, aggiungere, rinominare ed eliminare.
+// Le modifiche riscrivono l'indice nel documento (operazione annullabile come quelle sulle pagine).
+let outlineTree = null; // [{ title, page, url, items }]
+async function readOutline(doc) {
+  const raw = await doc.getOutline().catch(() => null);
+  const conv = (items) => Promise.all(items.map(async (it) => {
+    let page = null;
+    try {
+      let d = it.dest;
+      if (typeof d === 'string') d = await doc.getDestination(d);
+      if (Array.isArray(d)) page = typeof d[0] === 'number' ? d[0] : await doc.getPageIndex(d[0]);
+    } catch { /* destinazione non valida */ }
+    return { title: it.title || '', page, url: it.url || null, items: it.items?.length ? await conv(it.items) : [] };
+  }));
+  return raw?.length ? conv(raw) : [];
 }
 
+async function buildOutline() {
+  const list = $('outlineList'), doc = state.doc;
+  list.replaceChildren();
+  $('addMark').disabled = !doc || state.encrypted;
+  if (!doc) return;
+  const tree = await readOutline(doc);
+  if (doc !== state.doc) return;
+  outlineTree = tree;
+  if (!tree.length) { list.innerHTML = '<div class="empty">Questo PDF non ha un indice.<br>Aggiungi un segnalibro alla pagina corrente con il pulsante qui sopra.</div>'; return; }
+  const walk = (items, depth) => {
+    items.forEach((it, i) => {
+      const row = document.createElement('div');
+      row.className = 'mk';
+      const b = document.createElement('button');
+      b.className = 'item'; b.style.paddingLeft = `${9 + depth * 14}px`;
+      b.innerHTML = `${ic('bookmark')}<span>${esc(it.title || '(senza titolo)')}</span>${it.page != null ? `<small>p. ${it.page + 1}</small>` : ''}`;
+      b.addEventListener('click', () => {
+        if (it.page != null) goPage(it.page + 1);
+        else if (it.url) { if (window.native) window.native.openExternal(it.url); else window.open(it.url, '_blank', 'noopener'); }
+      });
+      const act = document.createElement('div');
+      act.className = 'mk-act';
+      if (!state.encrypted) {
+        const mk = (icon, title, fn, cls = '') => {
+          const x = document.createElement('button'); x.innerHTML = ic(icon); x.title = title; x.className = cls;
+          x.addEventListener('click', fn); act.append(x);
+        };
+        mk('rename', 'Rinomina', async () => {
+          const name = await promptDialog({ title: 'Rinomina segnalibro', value: it.title, ok: 'Rinomina' });
+          if (name && name !== it.title) { it.title = name; saveOutline(); }
+        });
+        mk('trash', it.items.length ? 'Elimina (con i segnalibri interni)' : 'Elimina', () => { items.splice(i, 1); saveOutline(); }, 'del');
+      }
+      row.append(b, act);
+      list.append(row);
+      if (it.items.length) walk(it.items, depth + 1);
+    });
+  };
+  walk(tree, 0);
+}
+const saveOutline = () => { const tree = structuredClone(outlineTree); return pageOp((l) => writeOutline(l, tree), null); };
+$('addMark').addEventListener('click', async () => {
+  if (!state.doc || state.encrypted) return;
+  const page = currentPage();
+  const title = await promptDialog({ title: 'Nuovo segnalibro', label: `Pagina ${page + 1}`, value: `Pagina ${page + 1}`, ok: 'Aggiungi' });
+  if (!title) return;
+  outlineTree ??= await readOutline(state.doc);
+  const at = outlineTree.findIndex((it) => it.page != null && it.page > page);
+  outlineTree.splice(at < 0 ? outlineTree.length : at, 0, { title, page, url: null, items: [] });
+  saveOutline();
+});
+
 // Ricerca nel testo: solo su richiesta (Invio), una pagina alla volta, annullabile.
+// I risultati sono evidenziati sulle pagine; F3 / Maiusc+F3 passano al successivo / precedente.
 let searchRun = 0;
+const MAX_HITS = 300;
+function redrawHits(S) { for (const i of S.byPage.keys()) { const p = state.pages[i]; if (p?.key) draw(p); } }
+
 async function runSearch(q) {
   const list = $('searchList'), run = ++searchRun;
   list.replaceChildren();
+  const prev = state.search;
+  state.search = null;
+  if (prev) redrawHits(prev);
+  $('searchNav').hidden = true;
   q = q.trim();
   if (q.length < 2 || !state.doc) return;
-  const needle = q.toLowerCase();
-  let found = 0;
-  const doc = state.doc;
-  for (let i = 1; i <= doc.numPages && found < 300; i++) {
-    if (run !== searchRun || doc !== state.doc) return;
-    const content = await (await doc.getPage(i)).getTextContent();
-    const text = content.items.map((t) => t.str).join(' ').replace(/\s+/g, ' ');
-    const low = text.toLowerCase();
-    for (let at = low.indexOf(needle); at >= 0 && found < 300; at = low.indexOf(needle, at + needle.length)) {
-      found++;
-      const a = Math.max(0, at - 28), b = Math.min(text.length, at + needle.length + 40);
+  const pages = state.pages;
+  const S = { q, hits: [], cur: -1, byPage: new Map(), items: [] };
+  state.search = S;
+  for (const p of pages) {
+    if (run !== searchRun || pages !== state.pages) return;
+    const { items } = await textOf(p);
+    if (run !== searchRun || pages !== state.pages) return;
+    const found = findInItems(items, q, MAX_HITS - S.hits.length);
+    for (const h of found) {
+      const k = S.hits.length;
+      S.hits.push({ page: p.index, quads: h.quads });
+      if (!S.byPage.has(p.index)) S.byPage.set(p.index, []);
+      S.byPage.get(p.index).push(k);
       const item = document.createElement('button');
       item.className = 'item';
-      item.innerHTML = `<small>p. ${i}</small><span>${esc(text.slice(a, at))}<mark>${esc(text.slice(at, at + needle.length))}</mark>${esc(text.slice(at + needle.length, b))}</span>`;
-      item.addEventListener('click', () => goPage(i));
+      item.innerHTML = `<small>p. ${p.index + 1}</small><span>${esc(h.before)}<mark>${esc(h.match)}</mark>${esc(h.after)}</span>`;
+      item.addEventListener('click', () => gotoHit(k));
+      S.items.push(item);
       list.append(item);
     }
+    if (found.length && p.key) draw(p);
+    if (S.hits.length >= MAX_HITS) break;
   }
   if (run !== searchRun) return;
-  if (!found) list.innerHTML = '<div class="empty">Nessun risultato.</div>';
-  else {
-    const head = document.createElement('div');
-    head.className = 'summary';
-    head.textContent = found >= 300 ? 'Oltre 300 risultati (mostrati i primi 300)' : `${found} ${found === 1 ? 'risultato' : 'risultati'}`;
-    list.prepend(head);
-  }
+  if (!S.hits.length) { list.innerHTML = '<div class="empty">Nessun risultato.</div>'; return; }
+  const head = document.createElement('div');
+  head.className = 'summary';
+  head.textContent = S.hits.length >= MAX_HITS ? `Oltre ${MAX_HITS} risultati (mostrati i primi ${MAX_HITS})` : `${S.hits.length} ${S.hits.length === 1 ? 'risultato' : 'risultati'}`;
+  list.prepend(head);
+  $('searchNav').hidden = false;
+  updateSearchPos();
 }
-$('q').addEventListener('keydown', (e) => { if (e.key === 'Enter') runSearch(e.target.value); });
+
+const updateSearchPos = () => {
+  const S = state.search;
+  if (S) $('searchPos').textContent = S.cur < 0 ? `${S.hits.length} risultati` : `${S.cur + 1} di ${S.hits.length}`;
+};
+
+function gotoHit(k) {
+  const S = state.search, hit = S?.hits[k];
+  if (!hit) return;
+  const old = S.cur >= 0 ? S.hits[S.cur].page : -1;
+  S.items[S.cur]?.classList.remove('on');
+  S.cur = k;
+  S.items[k]?.classList.add('on');
+  S.items[k]?.scrollIntoView({ block: 'nearest' });
+  const p = state.pages[hit.page];
+  const [, y0] = quadBox(p.vp, hit.quads[0] || [0, 0, 0, 0, 0, 0, 0, 0]);
+  p.el.scrollIntoView({ block: 'start' });
+  els.pages.scrollTop += y0 - els.pages.clientHeight / 3;
+  if (old >= 0 && old !== hit.page && state.pages[old]?.key) draw(state.pages[old]);
+  if (p.key) draw(p);
+  updateSearchPos();
+}
+
+function searchStep(dir) {
+  const S = state.search, q = $('q').value.trim();
+  if (!S || S.q !== q) {
+    if (q.length >= 2) runSearch(q).then(() => { if (state.search?.hits.length) gotoHit(dir > 0 ? 0 : state.search.hits.length - 1); });
+    else { if (sidePanel !== 'search') openPanel('search'); $('q').focus(); }
+    return;
+  }
+  if (!S.hits.length) return;
+  const n = S.hits.length;
+  gotoHit(S.cur < 0 ? (dir > 0 ? 0 : n - 1) : (S.cur + dir + n) % n);
+}
+$('q').addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); searchStep(e.shiftKey ? -1 : 1); } });
+$('q').addEventListener('input', (e) => { if (!e.target.value.trim() && state.search) runSearch(''); });
+$('searchPrev').addEventListener('click', () => searchStep(-1));
+$('searchNext').addEventListener('click', () => searchStep(1));
 
 // Elenco delle annotazioni (anche quelle create con Drawboard)
 const MARKUP_LABEL = { Ink: ['pen', 'Penna'], Highlight: ['highlighter', 'Evidenziatore'], Underline: ['underline', 'Sottolineatura'], StrikeOut: ['strike', 'Barrato'], Squiggly: ['underline', 'Ondulato'], Square: ['rect', 'Rettangolo'], Circle: ['circle', 'Ellisse'], Line: ['line', 'Linea'], FreeText: ['text', 'Testo'] };
@@ -1292,7 +2098,10 @@ function buildMarkups() {
   }, 250);
 }
 
-const setChrome = (on) => { rail.hidden = !on; els.fav.hidden = !on; $('zoombar').hidden = !on; if (!on && sidePanel) openPanel(sidePanel); };
+const setChrome = (on) => {
+  rail.hidden = !on; els.fav.hidden = !on; $('zoombar').hidden = !on; $('menuWrap').hidden = !on;
+  if (!on) { setMenu(false); if (sidePanel) openPanel(sidePanel); }
+};
 const refreshPanels = () => {
   $('railCount').textContent = String(state.doc?.numPages ?? 0);
   if (sidePanel === 'outline') buildOutline();
@@ -1300,15 +2109,41 @@ const refreshPanels = () => {
   if (sidePanel === 'search') runSearch($('q').value);
 };
 
-/* ---------- pagine: miniature + modifica del documento (aggiungi, elimina, ruota, riordina) ---------- */
+/* ---------- pagine: miniature + modifica del documento (aggiungi, elimina, ruota, riordina, estrai) ---------- */
 const thumbList = $('thumbList');
 const THUMB_W = 132;
 let thumbIO = null, busyOp = false, curThumb = -1;
+// Selezione multipla delle miniature (Ctrl+clic, Maiusc+clic)
+const thumbSel = new Set();
+let thumbAnchor = -1;
+
+function markThumbSel() {
+  for (const el of thumbList.children) el.classList.toggle('sel', thumbSel.has(+el.dataset.i));
+  $('thumbBar').hidden = !thumbSel.size;
+  $('thumbSelN').textContent = thumbSel.size === 1 ? '1 pagina selezionata' : `${thumbSel.size} pagine selezionate`;
+}
+
+function thumbClick(i, e) {
+  if (e.shiftKey && thumbAnchor >= 0) {
+    if (!(e.ctrlKey || e.metaKey)) thumbSel.clear();
+    for (let k = Math.min(thumbAnchor, i); k <= Math.max(thumbAnchor, i); k++) thumbSel.add(k);
+  } else if (e.ctrlKey || e.metaKey) {
+    if (!thumbSel.has(i)) thumbSel.add(i); else thumbSel.delete(i);
+    thumbAnchor = i;
+  } else {
+    thumbSel.clear();
+    thumbAnchor = i;
+    goPage(i + 1);
+  }
+  markThumbSel();
+}
 
 function buildThumbs() {
   thumbIO?.disconnect();
   thumbList.replaceChildren();
   curThumb = -1;
+  for (const i of thumbSel) if (i >= state.pages.length) thumbSel.delete(i);
+  markThumbSel();
   if (!thumbsOpen() || !state.doc) return;
   thumbIO = new IntersectionObserver((es) => {
     for (const e of es) if (e.isIntersecting && !e.target.dataset.done) renderThumb(e.target);
@@ -1316,7 +2151,7 @@ function buildThumbs() {
   state.pages.forEach((p, i) => {
     const vp = p.proxy.getViewport({ scale: 1 }), h = Math.round((vp.height * THUMB_W) / vp.width);
     const it = document.createElement('div');
-    it.className = 'th'; it.dataset.i = i; it.draggable = true; it.tabIndex = 0;
+    it.className = `th${thumbSel.has(i) ? ' sel' : ''}`; it.dataset.i = i; it.draggable = true; it.tabIndex = 0;
     it.setAttribute('role', 'button'); it.setAttribute('aria-label', `Vai alla pagina ${i + 1}`);
     const c = document.createElement('canvas');
     c.style.width = `${THUMB_W}px`; c.style.height = `${h}px`;
@@ -1330,16 +2165,16 @@ function buildThumbs() {
     };
     mk('rotate', 'Ruota di 90°', () => pageOp((l) => rotatePage(l, i), i));
     mk('copy', 'Duplica la pagina', () => pageOp((l) => duplicatePage(l, i), i + 1));
-    mk('plus', 'Inserisci una pagina vuota dopo', () => pageOp((l) => insertBlank(l, i + 1), i + 1));
+    mk('plus', 'Inserisci una pagina vuota dopo', () => pageOp((l) => insertBlank(l, i + 1, $('blankKind').value), i + 1));
     mk('trash', 'Elimina la pagina', async () => {
-      if (await confirmDialog({ title: `Eliminare la pagina ${i + 1}?`, message: 'La pagina e le sue annotazioni verranno rimosse. Puoi ancora chiudere senza salvare per annullare.', ok: 'Elimina', danger: true })) {
+      if (await confirmDialog({ title: `Eliminare la pagina ${i + 1}?`, message: 'La pagina e le sue annotazioni verranno rimosse. Puoi annullare con Ctrl+Z.', ok: 'Elimina', danger: true })) {
         pageOp((l) => removePage(l, i), Math.max(0, i - 1));
       }
     }, 'del');
     it.append(c, n, bar);
-    it.addEventListener('click', () => goPage(i + 1));
+    it.addEventListener('click', (e) => thumbClick(i, e));
     it.addEventListener('keydown', (e) => {
-      if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); goPage(i + 1); }
+      if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); thumbClick(i, e); }
       else if (e.key === 'ArrowDown' || e.key === 'ArrowUp') { e.preventDefault(); e.stopPropagation(); thumbList.children[i + (e.key === 'ArrowDown' ? 1 : -1)]?.focus(); }
     });
     it.addEventListener('dragstart', (e) => e.dataTransfer.setData('application/x-oledpdf-page', String(i)));
@@ -1365,7 +2200,7 @@ async function renderThumb(it) {
   c.width = Math.floor(vp.width); c.height = Math.floor(vp.height);
   const ctx = c.getContext('2d', { alpha: false });
   try {
-    await p.proxy.render({ canvasContext: ctx, canvas: c, viewport: vp, annotationMode: pdfjs.AnnotationMode.DISABLE }).promise;
+    await p.proxy.render({ canvasContext: ctx, canvas: c, viewport: vp, annotationMode: RENDER_MODE }).promise;
   } catch { return; }
   if (state.dark) darken(c, ctx);
   for (const a of p.annots) if (!a.deleted) drawAnnot(ctx, vp, a); // anche le annotazioni compaiono nelle miniature
@@ -1378,11 +2213,78 @@ function markThumb(i) {
   thumbList.children[i]?.scrollIntoView({ block: 'nearest' });
 }
 
+const selPages = () => [...thumbSel].sort((a, b) => a - b);
+$('selClear').addEventListener('click', () => { thumbSel.clear(); markThumbSel(); });
+$('selRotate').addEventListener('click', () => { const list = selPages(); pageOp((l) => list.forEach((i) => rotatePage(l, i)), list[0], true); });
+$('selDelete').addEventListener('click', async () => {
+  const list = selPages();
+  if (!list.length) return;
+  if (list.length >= state.pages.length) { toast('Il documento deve avere almeno una pagina.', { type: 'warn' }); return; }
+  if (await confirmDialog({ title: `Eliminare ${list.length === 1 ? 'la pagina selezionata' : `${list.length} pagine`}?`, message: 'Le pagine e le loro annotazioni verranno rimosse. Puoi annullare con Ctrl+Z.', ok: 'Elimina', danger: true })) {
+    pageOp((l) => removePages(l, list), Math.max(0, list[0] - 1));
+  }
+});
+$('selExtract').addEventListener('click', async () => {
+  const list = selPages();
+  if (!list.length || !state.lib) return;
+  setStatus('Estrazione delle pagine…');
+  try {
+    const bytes = await extractPages(await bakedLib(), list);
+    setStatus('');
+    const n = await exportFile(`${stem()} (pagine ${compactRange(list)}).pdf`, bytes, 'pdf');
+    if (n) toast(`Pagine estratte in ${n}`, { type: 'ok', ms: 3000 });
+  } catch (e) { setStatus(''); toast(`Estrazione non riuscita: ${e.message}`, { type: 'error', ms: 8000 }); }
+});
+// [0,1,2,5] → "1-3, 6"
+function compactRange(list) {
+  const out = [];
+  for (let i = 0; i < list.length; i++) {
+    let j = i;
+    while (j + 1 < list.length && list[j + 1] === list[j] + 1) j++;
+    out.push(i === j ? `${list[i] + 1}` : `${list[i] + 1}-${list[j] + 1}`);
+    i = j;
+  }
+  return out.join(', ');
+}
+
+// Stato da ripristinare per annullare un'operazione sulle pagine: il PDF di partenza + le annotazioni non ancora salvate.
+const pageSnap = () => ({ type: 'page', bytes: active.src, pages: serializeDraft(state.pages), edited: active.edited, dirty: state.dirty });
+// Dopo un ricaricamento le operazioni sulle annotazioni (legate alle pagine di prima) non valgono più; restano quelle sulle pagine.
+const MAX_PAGE_UNDO = 15;
+const pageOnly = (list) => list.filter((o) => o.type === 'page' || o.type === 'draft');
+
+async function restorePages(op, dir) {
+  busyOp = true;
+  setStatus('Modifica delle pagine…');
+  try {
+    const here = pageSnap();
+    const undo = dir < 0 ? pageOnly(state.undo.slice(0, -1)) : [...pageOnly(state.undo), here].slice(-MAX_PAGE_UNDO);
+    const redo = dir < 0 ? [...pageOnly(state.redo), here] : pageOnly(state.redo.slice(0, -1));
+    await loadBytes(op.bytes, {
+      replace: true, structural: true, noDraft: true, name: state.name, path: state.path, handle: state.handle,
+      restore: { pages: op.pages, edited: op.edited, dirty: op.dirty || !!Object.keys(op.pages).length, undo, redo },
+    });
+    flushDraft();
+  } catch (e) {
+    console.error(e);
+    toast(`Operazione non riuscita: ${e.message}`, { type: 'error', ms: 8000 });
+  } finally {
+    busyOp = false;
+    setStatus('');
+  }
+}
+
 // Applica le annotazioni in sospeso, esegue l'operazione sul PDF e ricarica il documento (modificato, da salvare).
-async function pageOp(fn, goto) {
+// keepSel: la selezione delle miniature resta (es. dopo una rotazione).
+async function pageOp(fn, goto, keepSel = false) {
   if (!active || state.encrypted || busyOp) return;
   busyOp = true;
   setStatus('Modifica delle pagine…');
+  const snap = pageSnap(), sel = keepSel ? new Set(thumbSel) : null;
+  const reload = (bytes) => loadBytes(bytes, {
+    replace: true, structural: true, noDraft: true, name: state.name, path: state.path, handle: state.handle,
+    restore: { edited: bytes, dirty: true, undo: [...pageOnly(state.undo), snap].slice(-MAX_PAGE_UNDO), redo: [] },
+  });
   try {
     perf('start pageOp');
     for (const p of state.pages) await applyChanges(state.lib, state.lib.getPage(p.index), p.annots);
@@ -1391,17 +2293,17 @@ async function pageOp(fn, goto) {
       await fn(state.lib);
     } catch (e) {
       // le annotazioni sono già nel documento: risincronizza la vista prima di segnalare l'errore
-      const sync = await state.lib.save({ useObjectStreams: false, objectsPerTick: 2000 });
-      await loadBytes(sync, { replace: true, structural: true, noDraft: true, name: state.name, path: state.path, handle: state.handle });
+      await reload(await state.lib.save(SAVE_OPTS));
       throw e;
     }
     perf('operazione');
-    const bytes = await state.lib.save({ useObjectStreams: false, objectsPerTick: 2000 });
+    const bytes = await state.lib.save(SAVE_OPTS);
     perf('lib.save');
-    await loadBytes(bytes, { replace: true, structural: true, noDraft: true, name: state.name, path: state.path, handle: state.handle });
+    await reload(bytes);
     perf('loadBytes');
     flushDraft();
     perf('flushDraft');
+    if (sel) { for (const i of sel) thumbSel.add(i); markThumbSel(); }
     if (goto != null) goPage(goto + 1);
   } catch (e) {
     console.error(e);
@@ -1412,9 +2314,8 @@ async function pageOp(fn, goto) {
   }
 }
 
-
 const curPage = () => Math.max(0, (parseInt(els.pageNo.value, 10) || 1) - 1);
-$('addBlank').addEventListener('click', () => pageOp((l) => insertBlank(l, curPage() + 1), curPage() + 1));
+$('addBlank').addEventListener('click', () => { const kind = $('blankKind').value; pageOp((l) => insertBlank(l, curPage() + 1, kind), curPage() + 1); });
 $('addPdf').addEventListener('click', () => $('insFile').click());
 $('insFile').addEventListener('change', async (e) => {
   const f = e.target.files[0];
@@ -1423,6 +2324,53 @@ $('insFile').addEventListener('change', async (e) => {
   const bytes = new Uint8Array(await f.arrayBuffer()), at = curPage() + 1;
   await pageOp((l) => insertPdf(l, at, bytes), at);
 });
+
+/* ---------- file recenti (schermata iniziale) ---------- */
+// App: percorsi salvati dal processo principale. Browser: handle dei file in IndexedDB (riaperti con un permesso).
+async function addRecent(rec) {
+  try {
+    if (window.native) { if (rec.path) await window.native.recentAdd(rec.path); return; }
+    if (!rec.handle) return;
+    const list = (await kvGet('recent')) || [];
+    const keep = [];
+    for (const r of list) if (!(await r.handle.isSameEntry?.(rec.handle).catch(() => false)) && r.name !== rec.name) keep.push(r);
+    await kvSet('recent', [{ name: rec.name, handle: rec.handle }, ...keep].slice(0, 12));
+  } catch { /* storage non disponibile */ }
+}
+
+async function renderRecent() {
+  const box = $('recent'), list = $('recentList');
+  let items = [];
+  try {
+    if (window.native) items = (await window.native.recentList()).map((p) => ({ name: baseName(p), detail: p.slice(0, -baseName(p).length - 1), path: p }));
+    else items = ((await kvGet('recent')) || []).map((r) => ({ name: r.name, detail: 'Apri di nuovo (chiede il permesso)', handle: r.handle }));
+  } catch { items = []; }
+  if (docs.length) return; // nel frattempo è stato aperto un documento
+  list.replaceChildren(...items.slice(0, 8).map((it) => {
+    const b = document.createElement('button');
+    b.className = 'rec';
+    b.innerHTML = `${ic('file')}<span><b></b><small></small></span>`;
+    b.querySelector('b').textContent = it.name;
+    b.querySelector('small').textContent = it.detail;
+    b.title = it.path || it.name;
+    b.addEventListener('click', async () => {
+      try {
+        if (it.path) await openNative(await window.native.read(it.path));
+        else {
+          if ((await it.handle.requestPermission({ mode: 'readwrite' })) !== 'granted') return;
+          await openFromHandle(it.handle);
+        }
+      } catch {
+        toast(`Impossibile aprire "${it.name}": il file è stato spostato o eliminato.`, { type: 'error', ms: 6000 });
+        if (it.path) window.native.recentRemove(it.path);
+        else kvSet('recent', ((await kvGet('recent')) || []).filter((r) => r.name !== it.name));
+        renderRecent();
+      }
+    });
+    return b;
+  }));
+  box.hidden = !items.length;
+}
 
 /* ---------- sessione: tutte le schede, con zoom e posizione, ripristinate all'avvio ---------- */
 let sessTimer = 0;
@@ -1502,6 +2450,7 @@ async function resume() {
 }
 if (!window.launchQueue && !window.native) resume();
 else setTimeout(() => { if (!docs.length) resume(); }, 400); // lascia priorità a un PDF aperto da Esplora file
+renderRecent();
 
 if ('serviceWorker' in navigator && import.meta.env.PROD) navigator.serviceWorker.register('sw.js').catch(() => {});
 

@@ -29,8 +29,18 @@
       <span class="vsep" aria-hidden="true"></span>
       <button id="fit" class="ico" title="Adatta alla larghezza" aria-pressed="false"><i data-icon="fitWidth"></i></button>
       <button id="fitPage" class="ico" title="Pagina intera: la pagina entra nello schermo" aria-pressed="false"><i data-icon="fitPage"></i></button>
+      <button id="spread" class="ico" title="Due pagine affiancate" aria-pressed="false"><i data-icon="spread"></i></button>
     </div>
     <button id="save" class="btn primary" title="Salva (Ctrl+S)" disabled><i data-icon="save"></i><span class="lbl">Salva</span></button>
+    <div id="menuWrap" hidden>
+      <button id="menuBtn" class="ico" title="Altre azioni" aria-haspopup="menu" aria-expanded="false"><i data-icon="more"></i></button>
+      <div id="menu" role="menu" hidden>
+        <button role="menuitem" data-act="saveAs"><i data-icon="saveAs"></i><span>Salva con nome…</span><kbd>Ctrl+Maiusc+S</kbd></button>
+        <button role="menuitem" data-act="print"><i data-icon="print"></i><span>Stampa…</span><kbd>Ctrl+P</kbd></button>
+        <button role="menuitem" data-act="png"><i data-icon="image"></i><span>Esporta la pagina come immagine…</span></button>
+        <button role="menuitem" data-act="flatten"><i data-icon="flatten"></i><span>Esporta una copia appiattita…</span></button>
+      </div>
+    </div>
     <div id="winctl" hidden>
       <button id="wMin" title="Riduci a icona"><i data-icon="minimize"></i></button>
       <button id="wMax" title="Ingrandisci"><i data-icon="maximize"></i></button>
@@ -48,6 +58,10 @@
         <div id="resumeSlot"></div>
         <p class="sub">Le annotazioni create con Drawboard PDF restano modificabili.</p>
       </div>
+      <section id="recent" hidden aria-labelledby="h-recent">
+        <h2 id="h-recent"><i data-icon="recent"></i> Recenti</h2>
+        <div id="recentList"></div>
+      </section>
       <ul class="keys" aria-label="Scorciatoie principali">
         <li><span><kbd>Ctrl</kbd><kbd>O</kbd></span> Apri</li>
         <li><span><kbd>Ctrl</kbd><kbd>S</kbd></span> Salva</li>
@@ -74,17 +88,40 @@
           <button id="addBlank" class="btn soft" title="Aggiungi una pagina vuota dopo quella corrente"><i data-icon="addBlank"></i> Vuota</button>
           <button id="addPdf" class="btn soft" title="Inserisci le pagine di un altro PDF dopo quella corrente"><i data-icon="addPdf"></i> Da PDF</button>
         </div>
+        <label class="field compact"><span>Carta delle pagine vuote</span>
+          <select id="blankKind">
+            <option value="">Bianca</option>
+            <option value="lined">A righe</option>
+            <option value="grid">A quadretti</option>
+            <option value="dots">A punti</option>
+          </select>
+        </label>
+        <div id="thumbBar" hidden>
+          <span id="thumbSelN"></span>
+          <button id="selRotate" class="ico" title="Ruota le pagine selezionate"><i data-icon="rotate"></i></button>
+          <button id="selExtract" class="ico" title="Estrai le pagine selezionate in un nuovo PDF"><i data-icon="extract"></i></button>
+          <button id="selDelete" class="ico del" title="Elimina le pagine selezionate"><i data-icon="trash"></i></button>
+          <button id="selClear" class="ico" title="Annulla la selezione (Esc)"><i data-icon="close"></i></button>
+        </div>
+        <p class="hint-sm">Ctrl+clic o Maiusc+clic sulle miniature per selezionare più pagine.</p>
       </div>
       <div id="thumbList"></div>
       <input id="insFile" type="file" accept="application/pdf,.pdf" hidden>
     </section>
     <section id="p-outline" hidden aria-labelledby="h-outline">
-      <div class="thead"><h2 id="h-outline">Indice</h2></div>
+      <div class="thead"><h2 id="h-outline">Indice</h2>
+        <div class="tools"><button id="addMark" class="btn soft" title="Aggiungi un segnalibro alla pagina corrente"><i data-icon="bookmarkAdd"></i> Aggiungi segnalibro</button></div>
+      </div>
       <div id="outlineList" class="plist"></div>
     </section>
     <section id="p-search" hidden aria-labelledby="h-search">
       <div class="thead"><h2 id="h-search">Cerca</h2>
         <div class="searchbox"><i data-icon="search"></i><input id="q" type="search" placeholder="Cerca nel documento e premi Invio" autocomplete="off" aria-label="Testo da cercare"></div>
+        <div id="searchNav" class="tools" hidden>
+          <span id="searchPos" aria-live="polite"></span>
+          <button id="searchPrev" class="ico" title="Risultato precedente (Maiusc+F3)"><i data-icon="prev"></i></button>
+          <button id="searchNext" class="ico" title="Risultato successivo (F3)"><i data-icon="next"></i></button>
+        </div>
       </div>
       <div id="searchList" class="plist" aria-live="polite"></div>
     </section>
@@ -98,6 +135,9 @@
         <h3>Visualizzazione</h3>
         <button id="dark" class="switch on" role="switch" aria-checked="true">
           <i data-icon="moon"></i><span><b>Pagina scura</b><small>Inverte la pagina: nero OLED, meno consumo</small></span><span class="knob" aria-hidden="true"></span>
+        </button>
+        <button id="realImg" class="switch" role="switch" aria-checked="false">
+          <i data-icon="image"></i><span><b>Immagini a colori reali</b><small>Con la pagina scura foto e figure non vengono invertite (le pagine scansionate sì)</small></span><span class="knob" aria-hidden="true"></span>
         </button>
         <button id="eco" class="switch" role="switch" aria-checked="false">
           <i data-icon="leaf"></i><span><b>Risparmio energetico</b><small>Rendering a risoluzione ridotta. Si attiva da solo con batteria scarica</small></span><span class="knob" aria-hidden="true"></span>
@@ -126,8 +166,15 @@
         <dl class="kbd-list">
           <div><dt><kbd>Ctrl</kbd><kbd>O</kbd></dt><dd>Apri</dd></div>
           <div><dt><kbd>Ctrl</kbd><kbd>S</kbd></dt><dd>Salva</dd></div>
+          <div><dt><kbd>Ctrl</kbd><kbd>Maiusc</kbd><kbd>S</kbd></dt><dd>Salva con nome</dd></div>
           <div><dt><kbd>Ctrl</kbd><kbd>Z</kbd></dt><dd>Annulla</dd></div>
+          <div><dt><kbd>Ctrl</kbd><kbd>Y</kbd></dt><dd>Ripeti</dd></div>
+          <div><dt><kbd>Ctrl</kbd><kbd>P</kbd></dt><dd>Stampa</dd></div>
           <div><dt><kbd>Ctrl</kbd><kbd>F</kbd></dt><dd>Cerca</dd></div>
+          <div><dt><kbd>F3</kbd> <kbd>Maiusc</kbd><kbd>F3</kbd></dt><dd>Risultato successivo / precedente</dd></div>
+          <div><dt><kbd>1</kbd> … <kbd>9</kbd></dt><dd>Scegli lo strumento</dd></div>
+          <div><dt><kbd>L</kbd></dt><dd>Selezione a lazo</dd></div>
+          <div><dt><kbd>Canc</kbd></dt><dd>Elimina la selezione</dd></div>
           <div><dt><kbd>Ctrl</kbd><kbd>W</kbd></dt><dd>Chiudi scheda</dd></div>
           <div><dt><kbd>Ctrl</kbd><kbd>Tab</kbd></dt><dd>Scheda successiva</dd></div>
           <div><dt><kbd>Ctrl</kbd><kbd>N</kbd></dt><dd>Nuova finestra</dd></div>
@@ -140,13 +187,16 @@
   </aside>
 
   <aside id="fav" hidden aria-label="Strumenti">
-    <button id="view" class="tbtn" title="Sfoglia e seleziona (Esc)"><i data-icon="pointer"></i></button>
+    <button id="view" class="tbtn" title="Sfoglia e seleziona il testo (Esc)"><i data-icon="pointer"></i></button>
+    <button id="lasso" class="tbtn" title="Selezione a lazo: sposta, ridimensiona, ricolora o elimina le annotazioni (L)"><i data-icon="lasso"></i></button>
     <span class="hsep"></span>
     <div id="slots" role="toolbar" aria-orientation="vertical" aria-label="Strumenti di disegno"></div>
     <button id="addTool" class="tbtn add" title="Crea un nuovo strumento (penna, evidenziatore, gomma...)"><i data-icon="plus"></i></button>
     <span class="hsep"></span>
+    <button id="rulerBtn" class="tbtn" title="Righello: la penna traccia linee dritte lungo il bordo" aria-pressed="false"><i data-icon="ruler"></i></button>
     <button id="lock" class="tbtn" title="Blocco strumento: resta attivo dopo ogni tratto"><i data-icon="unlock"></i></button>
     <button id="undo" class="tbtn" title="Annulla (Ctrl+Z)" disabled><i data-icon="undo"></i></button>
+    <button id="redo" class="tbtn" title="Ripeti (Ctrl+Y)" disabled><i data-icon="redo"></i></button>
     <div id="pop" hidden role="dialog" aria-label="Modifica strumento">
       <div class="pop-head">
         <span id="popIcon" aria-hidden="true"></span>
@@ -170,6 +220,14 @@
       <button id="resetTools" class="btn link">Ripristina strumenti predefiniti</button>
     </div>
   </aside>
+
+  <div id="selbar" hidden role="toolbar" aria-label="Annotazioni selezionate">
+    <span id="selN"></span>
+    <div id="selSw"></div>
+    <button id="selDel" class="ico del" title="Elimina la selezione (Canc)"><i data-icon="trash"></i></button>
+  </div>
+  <div id="ruler" hidden aria-label="Righello: trascina per spostarlo, rotellina o due dita per ruotarlo" role="img"><span id="rulerDeg">0°</span></div>
+  <div id="printArea" aria-hidden="true"></div>
 
   <input id="file" type="file" accept="application/pdf,.pdf" hidden>
   <script type="module" src="/src/main.js"></script>

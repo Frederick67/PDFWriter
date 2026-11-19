@@ -1,5 +1,5 @@
 // Guscio Windows: finestra nera OLED, apertura/salvataggio file nativi, un'unica istanza.
-const { app, BrowserWindow, ipcMain, dialog, Menu, protocol, net } = require('electron');
+const { app, BrowserWindow, ipcMain, dialog, Menu, protocol, net, shell } = require('electron');
 const path = require('node:path');
 const fs = require('node:fs');
 const { pathToFileURL } = require('node:url');
@@ -23,6 +23,16 @@ const guard = (p) => {
   if (!isPdf(p) || !allowed.has(path.resolve(p))) throw new Error('Percorso non autorizzato');
   return path.resolve(p);
 };
+// Scrittura atomica: un crash non lascia un file a metà.
+const writeAtomic = (target, bytes) => {
+  const tmp = `${target}.oledpdf.tmp`;
+  fs.writeFileSync(tmp, Buffer.from(bytes));
+  fs.renameSync(tmp, target);
+};
+
+// File recenti: solo percorsi già scelti dall'utente.
+const recentFile = () => path.join(app.getPath('userData'), 'recent.json');
+const readRecent = () => { try { const r = JSON.parse(fs.readFileSync(recentFile(), 'utf8')); return Array.isArray(r) ? r.filter(isPdf) : []; } catch { return []; } };
 
 const wins = new Set();
 const cur = () => BrowserWindow.getFocusedWindow() || [...wins][0] || null;
@@ -99,18 +109,52 @@ if (!app.requestSingleInstanceLock()) {
       return { path: path.resolve(r.filePaths[0]), bytes: fs.readFileSync(r.filePaths[0]) };
     });
     ipcMain.handle('file-read', (_e, p) => ({ path: guard(p), bytes: fs.readFileSync(guard(p)) }));
-    ipcMain.handle('file-write', (_e, p, bytes) => {
-      const target = guard(p), tmp = `${target}.oledpdf.tmp`;
-      fs.writeFileSync(tmp, Buffer.from(bytes));
-      fs.renameSync(tmp, target); // scrittura atomica: un crash non lascia un PDF a metà
-      return true;
-    });
+    ipcMain.handle('file-write', (_e, p, bytes) => { writeAtomic(guard(p), bytes); return true; });
     ipcMain.handle('dlg-saveas', async (e, name, bytes) => {
       const r = await dialog.showSaveDialog(BrowserWindow.fromWebContents(e.sender), { defaultPath: name, filters: [{ name: 'PDF', extensions: ['pdf'] }] });
       if (r.canceled || !r.filePath) return null;
-      allow(r.filePath);
-      fs.writeFileSync(r.filePath, Buffer.from(bytes));
-      return path.resolve(r.filePath);
+      const target = isPdf(r.filePath) ? r.filePath : `${r.filePath}.pdf`;
+      allow(target);
+      writeAtomic(path.resolve(target), bytes);
+      return path.resolve(target);
+    });
+    // Esportazioni (copia PDF, pagine estratte, immagini): il file non diventa un documento aperto.
+    const EXPORT = { pdf: 'PDF', png: 'Immagine PNG' };
+    ipcMain.handle('dlg-export', async (e, name, bytes, ext) => {
+      if (!EXPORT[ext]) throw new Error('Formato non supportato');
+      const r = await dialog.showSaveDialog(BrowserWindow.fromWebContents(e.sender), { defaultPath: name, filters: [{ name: EXPORT[ext], extensions: [ext] }] });
+      if (r.canceled || !r.filePath) return null;
+      const target = path.resolve(r.filePath.toLowerCase().endsWith(`.${ext}`) ? r.filePath : `${r.filePath}.${ext}`);
+      writeAtomic(target, bytes);
+      if (ext === 'pdf') allow(target);
+      return target;
+    });
+    ipcMain.handle('open-external', (_e, url) => {
+      if (typeof url === 'string' && /^(https?:|mailto:)/i.test(url)) shell.openExternal(url);
+      return true;
+    });
+    // Font TrueType di sistema per il testo libero (lettere accentate, greco, cirillico, simboli).
+    ipcMain.handle('system-font', () => {
+      const dir = path.join(process.env.WINDIR || 'C:\\Windows', 'Fonts');
+      for (const f of ['arial.ttf', 'segoeui.ttf']) {
+        try { return fs.readFileSync(path.join(dir, f)); } catch { /* prova il successivo */ }
+      }
+      return null;
+    });
+    ipcMain.handle('recent-list', () => {
+      const list = readRecent().filter((p) => fs.existsSync(p));
+      for (const p of list) allowed.add(path.resolve(p));
+      return list;
+    });
+    ipcMain.handle('recent-add', (_e, p) => {
+      if (!isPdf(p) || !allowed.has(path.resolve(p))) return false;
+      const list = [path.resolve(p), ...readRecent().filter((x) => path.resolve(x) !== path.resolve(p))].slice(0, 12);
+      try { fs.writeFileSync(recentFile(), JSON.stringify(list)); } catch { /* ignore */ }
+      return true;
+    });
+    ipcMain.handle('recent-remove', (_e, p) => {
+      try { fs.writeFileSync(recentFile(), JSON.stringify(readRecent().filter((x) => path.resolve(x) !== path.resolve(String(p))))); } catch { /* ignore */ }
+      return true;
     });
     ipcMain.handle('session-save', (_e, tabs, active) => {
       const clean = (Array.isArray(tabs) ? tabs : [])

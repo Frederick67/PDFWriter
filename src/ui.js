@@ -114,6 +114,28 @@ export function confirmDialog({ title, message, ok = 'Conferma', cancel = 'Annul
   });
 }
 
+// Richiesta di un testo (es. nome di un segnalibro). Restituisce null se annullata.
+export function promptDialog({ title, label = '', value = '', ok = 'OK', cancel = 'Annulla' }) {
+  return new Promise((resolve) => {
+    const d = document.createElement('dialog');
+    d.className = 'dlg';
+    d.innerHTML = `<form method="dialog"><h2></h2><label class="dlg-field"><span></span><input type="text" maxlength="200" autocomplete="off"></label><div class="dlg-row">
+      <button value="cancel" class="btn ghost" formnovalidate></button><button value="ok" class="btn primary"></button></div></form>`;
+    d.querySelector('h2').textContent = title;
+    d.querySelector('label span').textContent = label;
+    const input = d.querySelector('input');
+    input.value = value;
+    // Invio conferma (l'invio implicito del form userebbe il primo pulsante, cioè Annulla)
+    input.addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); d.close('ok'); } });
+    const [bc, bo] = d.querySelectorAll('button');
+    bc.textContent = cancel; bo.textContent = ok;
+    d.addEventListener('close', () => { resolve(d.returnValue === 'ok' ? input.value.trim() : null); d.remove(); });
+    document.body.append(d);
+    d.showModal();
+    input.focus(); input.select();
+  });
+}
+
 export function initUI() {
   document.body.append(toasts, busy);
   initTips();
